@@ -66,6 +66,7 @@ assert_eq!(result.repaired["derives"][0], "Debug");     // Debg → Debug
 | Enum array value | `["Debg"]` | `["Debug"]` |
 | Nested object field (any depth) | `{"server": {"prot": 80}}` | `{"server": {"port": 80}}` |
 | Array of objects | `[{"nam": "a"}]` | `[{"name": "a"}]` |
+| Nested tagged enum / intent array | `{"intents": [{"type": "AddDeriv", ...}]}` | `{"intents": [{"type": "AddDerive", ...}]}` |
 
 ### Type Coercion (Schema-Driven)
 
@@ -91,7 +92,8 @@ schema generator.
 | `string` / `integer` / `number` / `boolean` | coercion `FieldKind`s |
 | `enum`, arrays of enums, nested objects, arrays of objects | matching `FieldKind`s |
 | `$ref` / `$defs` (incl. Draft 2020-12 sibling `$ref`) | resolved; cycles cut to `Any` + warning |
-| Unsupported constructs (`allOf`, tuples, nested `oneOf`, ...) | degrade to `Any` + `ImportWarning` (never silent) |
+| Nested `oneOf` + tag `const` on a field (incl. arrays of them) | `FieldKind::TaggedEnum` / `TaggedEnumArray` (recursive repair) |
+| Unsupported constructs (`allOf`, tuples, non-tagged `oneOf`, ...) | degrade to `Any` + `ImportWarning` (never silent) |
 
 Externally tagged enums (serde's default representation) and untagged enums
 are rejected with an explicit error — annotate the enum with
@@ -101,10 +103,10 @@ are rejected with an explicit error — annotate the enum with
 
 ```toml
 [dependencies]
-fuzzy-parser = "0.2"
+fuzzy-parser = "0.3"
 
 # Optional: derive repair schemas from #[derive(JsonSchema)] types
-fuzzy-parser = { version = "0.2", features = ["schemars"] }
+fuzzy-parser = { version = "0.3", features = ["schemars"] }
 ```
 
 ## Usage
@@ -313,6 +315,12 @@ for skipped in &result.skipped {
    collision-skipped renames are recorded as `SkippedCorrection` structs
 4. **Safety**: No corrections made below similarity threshold; type coercion
    is lossless-only
+
+## Migrating from 0.2
+
+`FieldKind` gained `TaggedEnum` / `TaggedEnumArray` variants and is now
+`#[non_exhaustive]`: external `match` expressions over `FieldKind` need a
+wildcard arm. Everything else is unchanged.
 
 ## Migrating from 0.1
 

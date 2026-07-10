@@ -23,6 +23,10 @@
 //!   `boolean` → [`FieldKind::Bool`], `object` → [`FieldKind::Object`]
 //!   (recursive), arrays of string enums → [`FieldKind::EnumArray`],
 //!   arrays of objects → [`FieldKind::ObjectArray`].
+//! - **Nested tagged enums**: a field whose schema is itself a
+//!   `oneOf` + tag `const` union maps to [`FieldKind::TaggedEnum`]
+//!   (arrays of them to [`FieldKind::TaggedEnumArray`]), so DSL shapes
+//!   like `intents: [tagged enum, ...]` repair recursively.
 //!
 //! # Deliberately unsupported (v1)
 //!
@@ -32,9 +36,9 @@
 //! - **`required` / `default` completion**: missing fields are not filled
 //!   in; the keywords are ignored.
 //! - Constructs with no repair semantics (`allOf`, `patternProperties`,
-//!   tuples via `prefixItems`, nested `oneOf` on fields, recursive `$ref`
-//!   cycles) degrade to [`FieldKind::Any`] and are reported as
-//!   [`ImportWarning`]s rather than silently dropped.
+//!   tuples via `prefixItems`, non-tagged `oneOf` / `anyOf` on fields,
+//!   recursive `$ref` cycles) degrade to [`FieldKind::Any`] and are
+//!   reported as [`ImportWarning`]s rather than silently dropped.
 
 use crate::error::FuzzyError;
 use crate::schema::{FieldKind, ObjectSchema, TaggedEnumSchema};
@@ -117,54 +121,9 @@ impl TaggedEnumSchema {
             ));
         };
 
-        // Resolve each branch (newtype variants carry a sibling $ref)
-        let mut resolved = Vec::with_capacity(branches.len());
-        for (i, branch) in branches.iter().enumerate() {
-            let path = format!("$.oneOf[{}]", i);
-            let obj = ctx.resolve_schema_object(branch, &path).ok_or_else(|| {
-                FuzzyError::SchemaImport(format!("{} is not an object schema", path))
-            })?;
-            resolved.push(obj);
-        }
-
-        // Detect the tag field: a property present in every branch with a
-        // const (or single-element enum) string value.
-        let candidates = tag_candidates(&resolved);
-        let tag_field = match candidates.len() {
-            1 => candidates.into_iter().next().expect("len checked"),
-            0 => {
-                return Err(FuzzyError::SchemaImport(
-                    "no common tag property with a `const` string was found across \
-                     `oneOf` branches; externally tagged enums (serde's default \
-                     representation) are not supported — annotate the enum with \
-                     #[serde(tag = \"...\")]"
-                        .into(),
-                ))
-            }
-            _ => {
-                return Err(FuzzyError::SchemaImport(format!(
-                    "ambiguous tag field: multiple const properties are shared by \
-                     every `oneOf` branch: {:?}",
-                    candidates
-                )))
-            }
-        };
-
-        let mut schema = TaggedEnumSchema::with_tag(&tag_field);
-        for (i, branch) in resolved.iter().enumerate() {
-            let path = format!("$.oneOf[{}]", i);
-            let tag_value = branch
-                .get("properties")
-                .and_then(Value::as_object)
-                .and_then(|props| props.get(&tag_field))
-                .and_then(tag_string)
-                .expect("tag candidates verified per branch");
-            if schema.is_valid_tag(&tag_value) {
-                ctx.warn(&path, format!("duplicate tag value `{}`; branch replaces the earlier one", tag_value));
-            }
-            let variant = ctx.convert_object(branch, &path, Some(&tag_field));
-            schema = schema.with_variant(tag_value, variant);
-        }
+        let schema = ctx
+            .convert_tagged_enum(branches, "$")
+            .map_err(FuzzyError::SchemaImport)?;
 
         Ok(SchemaImport {
             schema,
@@ -305,6 +264,74 @@ impl<'a> ImportCtx<'a> {
         }
     }
 
+    /// Convert a `oneOf` branch list into a [`TaggedEnumSchema`].
+    ///
+    /// Errors are returned as plain strings so callers can choose between
+    /// a hard error (schema root) and a warning + [`FieldKind::Any`]
+    /// degradation (field position).
+    fn convert_tagged_enum(
+        &mut self,
+        branches: &[Value],
+        base_path: &str,
+    ) -> Result<TaggedEnumSchema, String> {
+        // Resolve each branch (newtype variants carry a sibling $ref)
+        let mut resolved = Vec::with_capacity(branches.len());
+        for (i, branch) in branches.iter().enumerate() {
+            let path = format!("{}.oneOf[{}]", base_path, i);
+            let obj = self
+                .resolve_schema_object(branch, &path)
+                .ok_or_else(|| format!("{} is not an object schema", path))?;
+            resolved.push(obj);
+        }
+
+        // Detect the tag field: a property present in every branch with a
+        // const (or single-element enum) string value.
+        let candidates = tag_candidates(&resolved);
+        let tag_field = match candidates.len() {
+            1 => candidates.into_iter().next().expect("len checked"),
+            0 => {
+                return Err(
+                    "no common tag property with a `const` string was found across \
+                     `oneOf` branches; externally tagged enums (serde's default \
+                     representation) are not supported — annotate the enum with \
+                     #[serde(tag = \"...\")]"
+                        .into(),
+                )
+            }
+            _ => {
+                return Err(format!(
+                    "ambiguous tag field: multiple const properties are shared by \
+                     every `oneOf` branch: {:?}",
+                    candidates
+                ))
+            }
+        };
+
+        let mut schema = TaggedEnumSchema::with_tag(&tag_field);
+        for (i, branch) in resolved.iter().enumerate() {
+            let path = format!("{}.oneOf[{}]", base_path, i);
+            let tag_value = branch
+                .get("properties")
+                .and_then(Value::as_object)
+                .and_then(|props| props.get(&tag_field))
+                .and_then(tag_string)
+                .expect("tag candidates verified per branch");
+            if schema.is_valid_tag(&tag_value) {
+                self.warn(
+                    &path,
+                    format!(
+                        "duplicate tag value `{}`; branch replaces the earlier one",
+                        tag_value
+                    ),
+                );
+            }
+            let variant = self.convert_object(branch, &path, Some(&tag_field));
+            schema = schema.with_variant(tag_value, variant);
+        }
+
+        Ok(schema)
+    }
+
     /// Convert an (already resolved) object schema's `properties` into an
     /// [`ObjectSchema`], skipping the tag field if given.
     fn convert_object(
@@ -372,19 +399,32 @@ impl<'a> ImportCtx<'a> {
             return FieldKind::Any;
         }
 
-        // Compositions: unwrap Option<T>-style nullables, reject the rest
+        // Compositions: unwrap Option<T>-style nullables; a `oneOf` may be
+        // a nested tagged enum, which converts to its own repair schema.
         for keyword in ["anyOf", "oneOf"] {
             if let Some(branches) = obj.get(keyword).and_then(Value::as_array) {
                 if let Some(inner) = nullable_unwrap(branches) {
                     return self.convert_kind(inner, path);
                 }
+                if keyword == "oneOf" {
+                    match self.convert_tagged_enum(branches, path) {
+                        Ok(nested) => return FieldKind::TaggedEnum(nested),
+                        Err(reason) => {
+                            self.warn(
+                                path,
+                                format!(
+                                    "`oneOf` on a field could not be imported as a \
+                                     tagged enum ({}); left as Any",
+                                    reason
+                                ),
+                            );
+                            return FieldKind::Any;
+                        }
+                    }
+                }
                 self.warn(
                     path,
-                    format!(
-                        "`{}` composition on a field (e.g. a nested tagged enum) \
-                         is not supported; left as Any",
-                        keyword
-                    ),
+                    "`anyOf` composition on a field is not supported; left as Any",
                 );
                 return FieldKind::Any;
             }
@@ -406,6 +446,7 @@ impl<'a> ImportCtx<'a> {
                 };
                 match self.convert_kind(items, &format!("{}.items", path)) {
                     FieldKind::Object(inner) => FieldKind::ObjectArray(inner),
+                    FieldKind::TaggedEnum(inner) => FieldKind::TaggedEnumArray(inner),
                     FieldKind::Enum(values) => FieldKind::EnumArray(values),
                     // Arrays of plain scalars: nothing to repair per-element
                     _ => FieldKind::Any,
@@ -819,7 +860,9 @@ mod tests {
     }
 
     #[test]
-    fn test_import_nested_oneof_degrades_with_warning() {
+    fn test_import_nested_tagged_enum_field() {
+        // A field whose schema is itself a tagged union converts to a
+        // nested TaggedEnum kind (no degradation, no warnings).
         let schema_doc = json!({
             "oneOf": [
                 {
@@ -828,8 +871,8 @@ mod tests {
                         "type": {"type": "string", "const": "A"},
                         "nested": {
                             "oneOf": [
-                                {"type": "object", "properties": {"kind": {"const": "X"}}},
-                                {"type": "object", "properties": {"kind": {"const": "Y"}}}
+                                {"type": "object", "properties": {"kind": {"const": "Expand"}, "value": {"type": "integer"}}},
+                                {"type": "object", "properties": {"kind": {"const": "Collapse"}}}
                             ]
                         }
                     }
@@ -839,11 +882,101 @@ mod tests {
 
         let import = TaggedEnumSchema::from_json_schema(&schema_doc).unwrap();
         let variant = import.schema.variant_schema("A").unwrap();
-        assert_eq!(variant.kind_of("nested"), Some(&FieldKind::Any));
+        let Some(FieldKind::TaggedEnum(nested)) = variant.kind_of("nested") else {
+            panic!("expected nested to map to a TaggedEnum kind");
+        };
+        assert_eq!(nested.tag_field, "kind");
+        assert!(nested.is_valid_tag("Expand"));
+        assert!(import.warnings.is_empty());
+
+        // Repair reaches into the nested union
+        let llm_json = r#"{"type": "A", "nested": {"kind": "Expnd", "vale": "3"}}"#;
+        let result =
+            repair_tagged_enum_json(llm_json, &import.schema, &FuzzyOptions::default()).unwrap();
+        assert_eq!(result.repaired["nested"]["kind"], "Expand");
+        assert_eq!(result.repaired["nested"]["value"], 3);
+    }
+
+    #[test]
+    fn test_import_array_of_tagged_enums() {
+        // DSL shape: a list of tagged intents
+        let schema_doc = json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "const": "Batch"},
+                        "intents": {
+                            "type": "array",
+                            "items": {
+                                "oneOf": [
+                                    {"type": "object", "properties": {
+                                        "type": {"const": "AddDerive"},
+                                        "target": {"type": "string"}
+                                    }},
+                                    {"type": "object", "properties": {
+                                        "type": {"const": "Rename"},
+                                        "from": {"type": "string"},
+                                        "to": {"type": "string"}
+                                    }}
+                                ]
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+
+        let import = TaggedEnumSchema::from_json_schema(&schema_doc).unwrap();
+        let variant = import.schema.variant_schema("Batch").unwrap();
+        assert!(matches!(
+            variant.kind_of("intents"),
+            Some(FieldKind::TaggedEnumArray(_))
+        ));
+        assert!(import.warnings.is_empty());
+
+        let llm_json = r#"{
+            "type": "Batch",
+            "intents": [
+                {"type": "AddDeriv", "taget": "User"},
+                {"type": "Renme", "from": "a", "too": "b"}
+            ]
+        }"#;
+        let result =
+            repair_tagged_enum_json(llm_json, &import.schema, &FuzzyOptions::default()).unwrap();
+        assert_eq!(result.repaired["intents"][0]["type"], "AddDerive");
+        assert!(result.repaired["intents"][0].get("target").is_some());
+        assert_eq!(result.repaired["intents"][1]["type"], "Rename");
+        assert!(result.repaired["intents"][1].get("to").is_some());
+    }
+
+    #[test]
+    fn test_import_untaggable_oneof_degrades_with_warning() {
+        // A oneOf that is not a tagged union (scalar branches) degrades
+        let schema_doc = json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "const": "A"},
+                        "loose": {
+                            "oneOf": [
+                                {"type": "integer"},
+                                {"type": "string"}
+                            ]
+                        }
+                    }
+                }
+            ]
+        });
+
+        let import = TaggedEnumSchema::from_json_schema(&schema_doc).unwrap();
+        let variant = import.schema.variant_schema("A").unwrap();
+        assert_eq!(variant.kind_of("loose"), Some(&FieldKind::Any));
         assert!(import
             .warnings
             .iter()
-            .any(|w| w.path.contains("nested") && w.detail.contains("oneOf")));
+            .any(|w| w.path.contains("loose") && w.detail.contains("tagged enum")));
     }
 
     #[test]

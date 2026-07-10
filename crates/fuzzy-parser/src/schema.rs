@@ -34,7 +34,11 @@
 ///
 /// Values that don't match the expected shape (e.g. a non-parseable string
 /// for [`FieldKind::Integer`]) are left untouched — no lossy repair is made.
+///
+/// This enum is `#[non_exhaustive]`: new repair kinds may be added in minor
+/// releases, so external `match` expressions need a wildcard arm.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub enum FieldKind {
     /// No value repair; the value is left untouched.
     #[default]
@@ -47,6 +51,12 @@ pub enum FieldKind {
     Object(ObjectSchema),
     /// An array of objects, each repaired recursively with the same schema.
     ObjectArray(ObjectSchema),
+    /// A nested tagged enum (discriminated union) repaired with its own
+    /// [`TaggedEnumSchema`]: tag value, field names, and field values.
+    TaggedEnum(TaggedEnumSchema),
+    /// An array of tagged enums, each repaired with the same schema
+    /// (e.g. a list of DSL intents).
+    TaggedEnumArray(TaggedEnumSchema),
     /// Coerce string-encoded integers to numbers (`"42"` → `42`).
     Integer,
     /// Coerce string-encoded numbers to numbers (`"4.2"` → `4.2`).
@@ -216,7 +226,7 @@ impl ObjectSchema {
 ///         .with_field_kind("timeout", FieldKind::Integer),
 /// );
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TaggedEnumSchema {
     /// The discriminator field name (e.g., "type", "kind")
     pub tag_field: String,

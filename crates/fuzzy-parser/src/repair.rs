@@ -343,6 +343,18 @@ fn apply_kind(
                 }
             }
         }
+        FieldKind::TaggedEnum(schema) => {
+            if let Value::Object(nested) = value {
+                let nested_log = repair_tagged_enum(nested, schema, path, options);
+                log.merge(nested_log);
+            }
+        }
+        FieldKind::TaggedEnumArray(schema) => {
+            if let Value::Array(arr) = value {
+                let arr_log = repair_tagged_enum_array(arr, schema, path, options);
+                log.merge(arr_log);
+            }
+        }
         FieldKind::Integer | FieldKind::Number | FieldKind::Bool | FieldKind::String => {
             coerce_value(value, kind, path, log);
         }
@@ -976,6 +988,68 @@ mod tests {
         assert!(result.repaired.get("name").is_some());
         assert!(result.repaired.get("path").is_some());
         assert_eq!(result.corrections.len(), 3);
+    }
+
+    #[test]
+    fn test_nested_tagged_enum_field_repair() {
+        // A variant field holds another tagged enum
+        let action_schema = TaggedEnumSchema::with_tag("kind")
+            .with_variant("Move", ObjectSchema::new(["from", "to"]))
+            .with_variant("Copy", ObjectSchema::new(["from", "to"]));
+        let schema = TaggedEnumSchema::with_tag("type").with_variant(
+            "Command",
+            ObjectSchema::new(["name"])
+                .with_field_kind("action", FieldKind::TaggedEnum(action_schema)),
+        );
+
+        let json = r#"{
+            "type": "Command",
+            "name": "x",
+            "action": {"kind": "Mve", "frm": "/a", "to": "/b"}
+        }"#;
+        let result =
+            repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+
+        assert_eq!(result.repaired["action"]["kind"], "Move");
+        assert!(result.repaired["action"].get("from").is_some());
+        assert_eq!(result.corrections.len(), 2);
+        assert!(result
+            .corrections
+            .iter()
+            .any(|c| c.field_path == "$.action.kind"));
+    }
+
+    #[test]
+    fn test_tagged_enum_array_field_repair() {
+        // A variant field holds an array of tagged enums (DSL intents)
+        let intent_schema = TaggedEnumSchema::with_tag("type")
+            .with_variant("AddDerive", ObjectSchema::new(["target"]))
+            .with_variant("Rename", ObjectSchema::new(["from", "to"]));
+        let schema = TaggedEnumSchema::with_tag("type").with_variant(
+            "Batch",
+            ObjectSchema::empty()
+                .with_field_kind("intents", FieldKind::TaggedEnumArray(intent_schema)),
+        );
+
+        let json = r#"{
+            "type": "Batch",
+            "intents": [
+                {"type": "AddDeriv", "taget": "User"},
+                {"type": "Renme", "from": "a", "too": "b"}
+            ]
+        }"#;
+        let result =
+            repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+
+        assert_eq!(result.repaired["intents"][0]["type"], "AddDerive");
+        assert!(result.repaired["intents"][0].get("target").is_some());
+        assert_eq!(result.repaired["intents"][1]["type"], "Rename");
+        assert!(result.repaired["intents"][1].get("to").is_some());
+        assert_eq!(result.corrections.len(), 4);
+        assert!(result
+            .corrections
+            .iter()
+            .any(|c| c.field_path.starts_with("$.intents[1]")));
     }
 
     #[test]

@@ -25,8 +25,9 @@
 //! - **Field name repair**: Fix field name typos (e.g., `"taget"` → `"target"`)
 //! - **Enum value repair**: Fix string values constrained to closed sets
 //!   (e.g., `["Debg"]` → `["Debug"]`)
-//! - **Recursive schemas**: Nested objects and arrays of objects are
-//!   repaired to any depth ([`FieldKind`])
+//! - **Recursive schemas**: Nested objects, arrays of objects, and nested
+//!   tagged enums (e.g. arrays of DSL intents) are repaired to any depth
+//!   ([`FieldKind`])
 //! - **Type coercion**: Fix string-encoded scalars (e.g., `"42"` → `42`)
 //! - **Dynamic schemas**: Schemas own their data and can be built at runtime
 //! - **JSON Schema import**: Derive repair schemas from JSON Schema
