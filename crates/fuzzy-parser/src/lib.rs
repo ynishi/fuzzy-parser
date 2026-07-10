@@ -8,21 +8,37 @@
 //! This crate provides **generic repair APIs** - the schema definitions
 //! live in the calling crate (e.g., your application defines the schema).
 //!
+//! The repair pipeline has three independent stages:
+//!
+//! 1. **Extract** ([`extract_json`]) — locate the JSON payload inside raw
+//!    LLM output (Markdown code fences, surrounding prose, multiple blocks)
+//! 2. **Sanitize** ([`sanitize_json`]) — fix syntax errors (trailing
+//!    commas, missing/mismatched closing delimiters, unclosed strings)
+//! 3. **Repair** ([`repair_tagged_enum_json`]) — fix typos and coerce
+//!    value types, guided by a caller-provided schema
+//!
 //! # Features
 //!
+//! - **JSON extraction**: Pull JSON out of code fences and prose
 //! - **JSON sanitization**: Fix syntax errors (trailing commas, missing braces)
 //! - **Tagged enum repair**: Fix type discriminator typos (e.g., `"AddDeriv"` → `"AddDerive"`)
 //! - **Field name repair**: Fix field name typos (e.g., `"taget"` → `"target"`)
-//! - **Enum array repair**: Fix values in enum arrays (e.g., `["Debg"]` → `["Debug"]`)
-//! - **Nested object repair**: Fix field names in nested objects
+//! - **Enum value repair**: Fix string values constrained to closed sets
+//!   (e.g., `["Debg"]` → `["Debug"]`)
+//! - **Recursive schemas**: Nested objects and arrays of objects are
+//!   repaired to any depth ([`FieldKind`])
+//! - **Type coercion**: Fix string-encoded scalars (e.g., `"42"` → `42`)
+//! - **Dynamic schemas**: Schemas own their data and can be built at runtime
+//! - **Transparency**: Every applied change is a [`Correction`]; every
+//!   collision-skipped rename is a [`SkippedCorrection`]
 //! - **Multiple algorithm support**: Jaro-Winkler, Levenshtein, Damerau-Levenshtein
 //! - **Configurable similarity threshold**
 //!
 //! # Example
 //!
-//! ```
+//! ````
 //! use fuzzy_parser::{
-//!     sanitize_json, repair_tagged_enum_json, TaggedEnumSchema, FuzzyOptions,
+//!     extract_json, sanitize_json, repair_tagged_enum_json, TaggedEnumSchema, FuzzyOptions,
 //! };
 //!
 //! // Define schema with enum arrays and nested objects
@@ -37,11 +53,19 @@
 //! .with_enum_array("derives", &["Debug", "Clone", "Serialize", "Default"])
 //! .with_nested_object("config", &["timeout", "retries"]);
 //!
-//! // LLM output with syntax errors AND typos
-//! let malformed = r#"{"type": "AddDeriv", "taget": "User", "derives": ["Debg",], "config": {"timout": 30,}}"#;
+//! // Raw LLM output: prose + code fence + syntax errors + typos
+//! let raw = r#"Here is the change you asked for:
+//!
+//! ```json
+//! {"type": "AddDeriv", "taget": "User", "derives": ["Debg",], "config": {"timout": 30,}}
+//! ```
+//! "#;
+//!
+//! // Step 0: Extract (strip prose and code fences)
+//! let payload = extract_json(raw).unwrap();
 //!
 //! // Step 1: Sanitize (fix syntax errors)
-//! let sanitized = sanitize_json(malformed);
+//! let sanitized = sanitize_json(payload);
 //!
 //! // Step 2: Repair (fix typos)
 //! let result = repair_tagged_enum_json(&sanitized, &schema, &FuzzyOptions::default()).unwrap();
@@ -50,12 +74,13 @@
 //! assert!(result.repaired.get("target").is_some());
 //! assert_eq!(result.repaired["derives"][0], "Debug");
 //! assert!(result.repaired["config"].get("timeout").is_some());
-//! ```
+//! ````
 
 #![warn(missing_docs)]
 
 pub mod distance;
 pub mod error;
+pub mod extract;
 pub mod repair;
 pub mod sanitize;
 pub mod schema;
@@ -63,12 +88,14 @@ pub mod schema;
 // Re-export main types
 pub use distance::{Algorithm, Match};
 pub use error::FuzzyError;
+pub use extract::{extract_json, extract_json_blocks, strip_code_fences};
 pub use repair::{
     repair_enum_array, repair_fields_with_list, repair_object_fields, repair_tagged_enum,
-    repair_tagged_enum_array, repair_tagged_enum_json, Correction, FuzzyOptions, RepairResult,
+    repair_tagged_enum_array, repair_tagged_enum_json, Correction, FuzzyOptions, RepairLog,
+    RepairResult, SkipReason, SkippedCorrection,
 };
 pub use sanitize::sanitize_json;
-pub use schema::{ObjectSchema, TaggedEnumSchema};
+pub use schema::{FieldDef, FieldKind, ObjectSchema, TaggedEnumSchema};
 
 #[cfg(test)]
 mod tests {
@@ -105,7 +132,7 @@ mod tests {
         // Define schema with enum arrays
         let schema =
             TaggedEnumSchema::new("type", &["AddDerive"], |_| Some(&["target", "derives"][..]))
-                .with_enum_array("derives", &["Debug", "Clone", "Serialize"]);
+                .with_enum_array("derives", ["Debug", "Clone", "Serialize"]);
 
         // LLM output with BOTH syntax errors AND typos
         let malformed_llm_output = r#"{
@@ -145,5 +172,24 @@ mod tests {
 
         assert_eq!(result.repaired["type"], "Action");
         assert_eq!(result.repaired["name"], "test");
+    }
+
+    #[test]
+    fn test_extract_sanitize_repair_full_pipeline() {
+        // Raw LLM output: prose + fence + trailing comma + typos + truncation
+        let raw = "Sure, here it is:\n\n```json\n{\"type\": \"AddDeriv\", \"taget\": \"User\", \"derives\": [\"Debg\",]\n```";
+
+        let schema =
+            TaggedEnumSchema::new("type", &["AddDerive"], |_| Some(&["target", "derives"][..]))
+                .with_enum_array("derives", ["Debug", "Clone"]);
+
+        let payload = extract_json(raw).unwrap();
+        let sanitized = sanitize_json(payload);
+        let result =
+            repair_tagged_enum_json(&sanitized, &schema, &FuzzyOptions::default()).unwrap();
+
+        assert_eq!(result.repaired["type"], "AddDerive");
+        assert_eq!(result.repaired["target"], "User");
+        assert_eq!(result.repaired["derives"][0], "Debug");
     }
 }

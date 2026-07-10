@@ -3,10 +3,11 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["Yutaka Nishimura <ytk.nishimura@gmail.com>"]
 license = "MIT OR Apache-2.0"
+description = "Fuzzy JSON repair for LLM-generated DSL"
 repository = "https://github.com/ynishi/fuzzy-parser"
 homepage = "https://github.com/ynishi/fuzzy-parser"
 documentation = "https://docs.rs/fuzzy-parser"
