@@ -111,6 +111,18 @@ pub fn repair_object_fields(
 /// Repair field names in a JSON object using a field list
 ///
 /// Returns the list of corrections made.
+///
+/// # Collision behavior (first-win)
+///
+/// A key is only renamed when the target field does not already exist in the
+/// object. This guards against destroying data: if two typo keys resolve to
+/// the same candidate, the first one processed wins and the later key is left
+/// unchanged (no correction is recorded for it). The same applies when the
+/// candidate is already present as a literal key. Keys are processed in the
+/// object's iteration order (for `serde_json::Map` this is sorted key order
+/// by default, or insertion order with the `preserve_order` feature).
+/// Recording skipped collisions in the result is planned for a future
+/// release, as it requires extending the public result types.
 pub fn repair_fields_with_list(
     obj: &mut Map<String, Value>,
     valid_fields: &[&str],
@@ -161,6 +173,13 @@ pub fn repair_fields_with_list(
 /// 4. Field names in nested objects
 ///
 /// Returns the list of corrections made.
+///
+/// # Collision behavior (first-win)
+///
+/// Field-name repair never overwrites an existing key: when two typo keys
+/// resolve to the same candidate, only the first is renamed and the later one
+/// is left as-is without a recorded correction. See
+/// [`repair_fields_with_list`] for details.
 pub fn repair_tagged_enum<F>(
     obj: &mut Map<String, Value>,
     schema: &TaggedEnumSchema<F>,
@@ -341,7 +360,12 @@ where
 mod tests {
     use super::*;
 
-    fn test_schema() -> TaggedEnumSchema<fn(&str) -> Option<&'static [&'static str]>> {
+    /// Field resolver signature used by the test schemas: maps a tag to its
+    /// allowed field list. Aliased to keep the `test_schema` return type
+    /// readable (and to satisfy `clippy::type_complexity`).
+    type FieldResolver = fn(&str) -> Option<&'static [&'static str]>;
+
+    fn test_schema() -> TaggedEnumSchema<FieldResolver> {
         TaggedEnumSchema::new(
             "type",
             &["AddDerive", "RemoveDerive", "RenameIdent"],
@@ -521,6 +545,43 @@ mod tests {
         assert_eq!(result.repaired["config"]["timeout"], 30);
         // Total corrections: type + target + 2 derives + timeout = 5
         assert_eq!(result.corrections.len(), 5);
+    }
+
+    #[test]
+    fn test_collision_first_win_two_typos_same_candidate() {
+        // Two typo keys ("taget", "targt") both resolve to "target".
+        // First-win: the first key processed is renamed, the second is left
+        // unchanged and no correction is recorded for it. This test pins the
+        // current behavior; recording skipped collisions requires extending
+        // the public result types and is deferred to a future release.
+        let json = r#"{"type": "AddDerive", "taget": "User", "targt": "Post"}"#;
+        let schema = test_schema();
+        let options = FuzzyOptions::default();
+
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        // Exactly one key won the rename; the other survives verbatim.
+        assert_eq!(result.repaired["target"], "User");
+        assert_eq!(result.repaired["targt"], "Post");
+        assert!(result.repaired.get("taget").is_none());
+        assert_eq!(result.corrections.len(), 1);
+        assert_eq!(result.corrections[0].original, "taget");
+        assert_eq!(result.corrections[0].corrected, "target");
+    }
+
+    #[test]
+    fn test_collision_first_win_existing_key_preserved() {
+        // The candidate already exists as a literal key: the typo key is NOT
+        // renamed onto it (no data loss), and no correction is recorded.
+        let json = r#"{"type": "AddDerive", "target": "User", "taget": "Post"}"#;
+        let schema = test_schema();
+        let options = FuzzyOptions::default();
+
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        assert_eq!(result.repaired["target"], "User");
+        assert_eq!(result.repaired["taget"], "Post");
+        assert!(!result.has_corrections());
     }
 
     #[test]

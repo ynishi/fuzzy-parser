@@ -3,11 +3,13 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-authors = ["Yutaka Nishimura"]
+authors = ["Yutaka Nishimura <ytk.nishimura@gmail.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ynishi/fuzzy-parser"
+homepage = "https://github.com/ynishi/fuzzy-parser"
+documentation = "https://docs.rs/fuzzy-parser"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }

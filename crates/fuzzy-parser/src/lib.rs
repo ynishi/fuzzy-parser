@@ -52,6 +52,8 @@
 //! assert!(result.repaired["config"].get("timeout").is_some());
 //! ```
 
+#![warn(missing_docs)]
+
 pub mod distance;
 pub mod error;
 pub mod repair;

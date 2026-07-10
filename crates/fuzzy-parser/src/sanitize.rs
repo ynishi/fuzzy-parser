@@ -8,6 +8,8 @@
 //! - **Trailing commas**: `{"a": 1,}` → `{"a": 1}`
 //! - **Missing closing braces**: `{"a": 1` → `{"a": 1}`
 //! - **Missing closing brackets**: `["a"` → `["a"]`
+//! - **Mismatched closing delimiters**: `{"a": [1}` → `{"a": [1]}`
+//! - **Stray closing delimiters**: `{"a": 1}}` → `{"a": 1}`
 //!
 //! # Example
 //!
@@ -51,6 +53,8 @@
 /// Fixes common syntax errors that LLMs produce:
 /// - Trailing commas before `}` or `]`
 /// - Missing closing braces `}` or brackets `]`
+/// - Mismatched closing delimiters (the expected closer is inserted first)
+/// - Stray closing delimiters with no matching opener (dropped)
 ///
 /// # Arguments
 ///
@@ -150,11 +154,21 @@ fn remove_trailing_commas(input: &str) -> String {
     result
 }
 
-/// Fix missing closing braces `}` and brackets `]`
+/// Fix missing or mismatched closing braces `}` and brackets `]`
 ///
-/// Counts unmatched opening delimiters and appends the necessary closing ones.
+/// Rebuilds the input while tracking opening delimiters on a stack, so that
+/// the output nesting is always balanced:
+///
+/// - A closer matching the stack top passes through unchanged.
+/// - A closer that mismatches the stack top first closes the intervening
+///   open scopes (`{"a": [1}` → `{"a": [1]}`). This recovers the common LLM
+///   failure of closing an outer scope while forgetting an inner one.
+/// - A stray closer with no matching opener on the stack is dropped
+///   (`{"a":1}}` → `{"a":1}`), since keeping it can only produce trailing
+///   garbage that serde_json rejects.
+/// - Any scopes still open at end of input are closed in reverse order.
 fn fix_missing_delimiters(input: &str) -> String {
-    let mut result = String::from(input);
+    let mut result = String::with_capacity(input.len() + 4);
     let mut in_string = false;
     let mut escape_next = false;
 
@@ -164,37 +178,43 @@ fn fix_missing_delimiters(input: &str) -> String {
     for c in input.chars() {
         if escape_next {
             escape_next = false;
+            result.push(c);
             continue;
         }
 
         match c {
             '\\' if in_string => {
                 escape_next = true;
+                result.push(c);
             }
             '"' => {
                 in_string = !in_string;
+                result.push(c);
             }
-            '{' if !in_string => {
-                stack.push('{');
+            '{' | '[' if !in_string => {
+                stack.push(c);
+                result.push(c);
             }
-            '[' if !in_string => {
-                stack.push('[');
-            }
-            '}' if !in_string => {
-                if let Some(&top) = stack.last() {
-                    if top == '{' {
+            '}' | ']' if !in_string => {
+                let opener = if c == '}' { '{' } else { '[' };
+                if stack.contains(&opener) {
+                    // Close intervening (mismatched) open scopes so the
+                    // output nesting stays valid, then emit this closer.
+                    while let Some(&top) = stack.last() {
+                        if top == opener {
+                            stack.pop();
+                            break;
+                        }
                         stack.pop();
+                        result.push(closer_for(top));
                     }
+                    result.push(c);
                 }
+                // No matching opener anywhere: drop the stray closer.
             }
-            ']' if !in_string => {
-                if let Some(&top) = stack.last() {
-                    if top == '[' {
-                        stack.pop();
-                    }
-                }
+            _ => {
+                result.push(c);
             }
-            _ => {}
         }
     }
 
@@ -205,14 +225,19 @@ fn fix_missing_delimiters(input: &str) -> String {
 
     // Append missing closing delimiters in reverse order
     for &opener in stack.iter().rev() {
-        match opener {
-            '{' => result.push('}'),
-            '[' => result.push(']'),
-            _ => {}
-        }
+        result.push(closer_for(opener));
     }
 
     result
+}
+
+/// The closing delimiter that matches an opening `{` or `[`
+fn closer_for(opener: char) -> char {
+    if opener == '{' {
+        '}'
+    } else {
+        ']'
+    }
 }
 
 #[cfg(test)]
@@ -309,6 +334,48 @@ mod tests {
     fn test_brace_in_string_ignored() {
         // Braces inside strings should NOT be counted
         assert_eq!(sanitize_json(r#"{"msg": "{"}"#), r#"{"msg": "{"}"#);
+    }
+
+    #[test]
+    fn test_mismatched_closer_object_over_array() {
+        // '}' arrives while '[' is still open: close the array first.
+        assert_eq!(sanitize_json(r#"{"a": [1}"#), r#"{"a": [1]}"#);
+    }
+
+    #[test]
+    fn test_mismatched_closer_array_over_object() {
+        // ']' arrives while '{' is still open: close the object first.
+        assert_eq!(sanitize_json(r#"[{"a":1]"#), r#"[{"a":1}]"#);
+    }
+
+    #[test]
+    fn test_stray_extra_closing_brace() {
+        // Second '}' has no matching opener: dropped.
+        assert_eq!(sanitize_json(r#"{"a":1}}"#), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn test_stray_extra_closing_bracket() {
+        assert_eq!(sanitize_json(r#"[1, 2]]"#), r#"[1, 2]"#);
+    }
+
+    #[test]
+    fn test_mismatched_closer_deep_nesting() {
+        // ']' closes both inner objects before matching the array.
+        assert_eq!(sanitize_json(r#"[{"a": {"b": 1]"#), r#"[{"a": {"b": 1}}]"#);
+    }
+
+    #[test]
+    fn test_mismatched_outputs_are_valid_json() {
+        for input in [r#"{"a": [1}"#, r#"{"a":1}}"#, r#"[{"a":1]"#, r#"[1, 2]]"#] {
+            let fixed = sanitize_json(input);
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&fixed).is_ok(),
+                "sanitize_json({:?}) produced invalid JSON: {:?}",
+                input,
+                fixed
+            );
+        }
     }
 
     #[test]

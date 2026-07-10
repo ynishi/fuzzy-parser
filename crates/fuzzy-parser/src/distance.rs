@@ -30,6 +30,11 @@ pub enum Algorithm {
 /// Calculate similarity between two strings
 ///
 /// Returns a value between 0.0 (completely different) and 1.0 (identical).
+///
+/// Levenshtein-based scores are normalized by the character count of the
+/// longer string (not the byte length), because strsim computes edit
+/// distance over `char`s. Using byte length would deflate scores for
+/// multi-byte (non-ASCII) input and could even produce negative values.
 pub fn similarity(a: &str, b: &str, algo: Algorithm) -> f64 {
     if a == b {
         return 1.0;
@@ -42,12 +47,12 @@ pub fn similarity(a: &str, b: &str, algo: Algorithm) -> f64 {
         Algorithm::JaroWinkler => jaro_winkler(a, b),
         Algorithm::Levenshtein => {
             let dist = levenshtein(a, b);
-            let max_len = a.len().max(b.len());
+            let max_len = a.chars().count().max(b.chars().count());
             1.0 - (dist as f64 / max_len as f64)
         }
         Algorithm::DamerauLevenshtein => {
             let dist = damerau_levenshtein(a, b);
-            let max_len = a.len().max(b.len());
+            let max_len = a.chars().count().max(b.chars().count());
             1.0 - (dist as f64 / max_len as f64)
         }
     }
@@ -63,6 +68,10 @@ pub struct Match {
 }
 
 impl Match {
+    /// Create a new match result
+    ///
+    /// Exists so callers (and internal code) can build a `Match` without
+    /// spelling out the `Into<String>` conversion at every call site.
     pub fn new(candidate: impl Into<String>, similarity: f64) -> Self {
         Self {
             candidate: candidate.into(),
@@ -84,7 +93,7 @@ pub fn find_closest<'a>(
         .into_iter()
         .map(|c| Match::new(c, similarity(input, c, algo)))
         .filter(|m| m.similarity >= min_similarity)
-        .max_by(|a, b| a.similarity.partial_cmp(&b.similarity).unwrap())
+        .max_by(|a, b| a.similarity.total_cmp(&b.similarity))
 }
 
 /// Find all matches above the minimum similarity threshold
@@ -102,7 +111,7 @@ pub fn find_all_matches<'a>(
         .filter(|m| m.similarity >= min_similarity)
         .collect();
 
-    matches.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+    matches.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
     matches
 }
 
@@ -190,6 +199,28 @@ mod tests {
         for i in 1..matches.len() {
             assert!(matches[i - 1].similarity >= matches[i].similarity);
         }
+    }
+
+    #[test]
+    fn test_levenshtein_normalization_non_ascii() {
+        // "こんにちは" vs "こんにちわ": 5 chars each, 1 substitution.
+        // Char-based normalization: 1 - 1/5 = 0.8.
+        // Byte-based normalization would give 1 - 1/15 ≈ 0.93 (wrong basis).
+        let sim = similarity("こんにちは", "こんにちわ", Algorithm::Levenshtein);
+        assert!((sim - 0.8).abs() < 1e-9, "Expected 0.8, got {}", sim);
+
+        let sim = similarity("こんにちは", "こんにちわ", Algorithm::DamerauLevenshtein);
+        assert!((sim - 0.8).abs() < 1e-9, "Expected 0.8, got {}", sim);
+    }
+
+    #[test]
+    fn test_levenshtein_non_ascii_completely_different() {
+        // Completely different Japanese strings must not go below 0.0.
+        // With byte-based normalization the score stays artificially high;
+        // with char-based it is exactly 0.0 here (3 chars, distance 3).
+        let sim = similarity("りんご", "みかん", Algorithm::Levenshtein);
+        assert!((0.0..=1.0).contains(&sim), "Score out of range: {}", sim);
+        assert!((sim - 0.0).abs() < 1e-9, "Expected 0.0, got {}", sim);
     }
 
     #[test]

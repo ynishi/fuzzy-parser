@@ -175,6 +175,23 @@ if result.has_corrections() {
 3. **Transparency**: All corrections are recorded as `Correction` structs
 4. **Safety**: No corrections made below similarity threshold
 
+## Known Limitations
+
+`sanitize_json` is a **best-effort** syntax repair pass, not a full JSON5 or
+lenient-JSON parser. It targets a small set of common LLM mistakes (trailing
+commas, missing/mismatched/stray closing delimiters, unclosed strings) and
+leaves the input otherwise untouched. In particular, the following are **not**
+repaired:
+
+- Single-quoted strings or keys (`{'a': 1}`)
+- Unquoted object keys (`{a: 1}`)
+- Markdown code fences around the payload (```` ```json … ``` ````)
+- JSON embedded in surrounding prose or explanatory text
+- Python-style literals (`True` / `False` / `None`) and comments
+
+If your inputs need broader lenient parsing, general-purpose crates such as
+[`llm_json`](https://crates.io/crates/llm_json) cover many of these cases.
+
 ## License
 
 MIT OR Apache-2.0
