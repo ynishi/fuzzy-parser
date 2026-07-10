@@ -78,11 +78,33 @@ assert_eq!(result.repaired["derives"][0], "Debug");     // Debg → Debug
 
 Coercion is lossless-only: unparseable values are left untouched.
 
+### JSON Schema Import
+
+Repair schemas can be derived from JSON Schema documents instead of being
+hand-built — including the output of `schemars`, Pydantic, or any other
+schema generator.
+
+| Input | Result |
+|-------|--------|
+| `oneOf` + tag `const` (internally / adjacently tagged enum) | `TaggedEnumSchema` |
+| Plain object schema | `ObjectSchema` |
+| `string` / `integer` / `number` / `boolean` | coercion `FieldKind`s |
+| `enum`, arrays of enums, nested objects, arrays of objects | matching `FieldKind`s |
+| `$ref` / `$defs` (incl. Draft 2020-12 sibling `$ref`) | resolved; cycles cut to `Any` + warning |
+| Unsupported constructs (`allOf`, tuples, nested `oneOf`, ...) | degrade to `Any` + `ImportWarning` (never silent) |
+
+Externally tagged enums (serde's default representation) and untagged enums
+are rejected with an explicit error — annotate the enum with
+`#[serde(tag = "...")]` so repair has a tag field to anchor on.
+
 ## Installation
 
 ```toml
 [dependencies]
 fuzzy-parser = "0.2"
+
+# Optional: derive repair schemas from #[derive(JsonSchema)] types
+fuzzy-parser = { version = "0.2", features = ["schemars"] }
 ```
 
 ## Usage
@@ -175,6 +197,39 @@ let mut schema = TaggedEnumSchema::with_tag("kind");
 for tag in &tags {
     schema = schema.with_variant(tag, ObjectSchema::new(&fields));
 }
+```
+
+### Importing a Schema from JSON Schema / schemars
+
+```rust
+use fuzzy_parser::{TaggedEnumSchema, FuzzyOptions, repair_tagged_enum_json};
+
+// From a JSON Schema document (any source: schemars, Pydantic, files, ...)
+let json_schema: serde_json::Value = serde_json::from_str(schema_text)?;
+let import = TaggedEnumSchema::from_json_schema(&json_schema)?;
+
+// Constructs without repair semantics are reported, never silently dropped
+for warning in &import.warnings {
+    eprintln!("schema import: {} — {}", warning.path, warning.detail);
+}
+
+let result = repair_tagged_enum_json(llm_json, &import.schema, &FuzzyOptions::default())?;
+```
+
+With the `schemars` feature, straight from a Rust type:
+
+```rust
+use fuzzy_parser::TaggedEnumSchema;
+
+#[derive(serde::Serialize, schemars::JsonSchema)]
+#[serde(tag = "type")]
+enum Intent {
+    AddDerive { target: String, count: i32 },
+    Rename { from: String, to: String },
+}
+
+let import = TaggedEnumSchema::from_type::<Intent>()?;
+// Tag typos, field typos, and "3" → 3 coercion now repair automatically
 ```
 
 ### Enum Array Repair

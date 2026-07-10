@@ -17,6 +17,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 strsim = { workspace = true }
 thiserror = { workspace = true }
+schemars = { workspace = true, optional = true }
+
+[features]
+schemars = ["dep:schemars"]
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

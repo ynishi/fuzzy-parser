@@ -12,4 +12,8 @@ pub enum FuzzyError {
     /// Expected an object but got something else
     #[error("Expected JSON object, got different type")]
     NotObject,
+
+    /// A JSON Schema document could not be converted into a repair schema
+    #[error("JSON Schema import failed: {0}")]
+    SchemaImport(String),
 }

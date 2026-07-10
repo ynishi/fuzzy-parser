@@ -1,6 +1,20 @@
 //! String distance/similarity calculation utilities
 //!
 //! This module provides wrappers around strsim algorithms for fuzzy matching.
+//! It is the measurement layer under the repair stage: every rename and
+//! enum-value correction is scored here, and only candidates at or above
+//! [`FuzzyOptions::min_similarity`](crate::FuzzyOptions) are applied.
+//!
+//! # Choosing an algorithm
+//!
+//! | [`Algorithm`] | Characteristics | Best for |
+//! |---|---|---|
+//! | [`Algorithm::JaroWinkler`] (default) | Prefix-weighted, handles transpositions | General LLM typos |
+//! | [`Algorithm::Levenshtein`] | Uniform insert/delete/substitute cost | Edit-distance semantics |
+//! | [`Algorithm::DamerauLevenshtein`] | Levenshtein + transpositions | Transposition-heavy typos |
+//!
+//! All similarities are normalized to `0.0..=1.0` (1.0 = identical), so the
+//! same threshold works across algorithms.
 
 use strsim::{damerau_levenshtein, jaro_winkler, levenshtein};
 

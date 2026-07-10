@@ -29,6 +29,9 @@
 //!   repaired to any depth ([`FieldKind`])
 //! - **Type coercion**: Fix string-encoded scalars (e.g., `"42"` → `42`)
 //! - **Dynamic schemas**: Schemas own their data and can be built at runtime
+//! - **JSON Schema import**: Derive repair schemas from JSON Schema
+//!   documents ([`TaggedEnumSchema::from_json_schema`]) or, with the
+//!   `schemars` feature, directly from `#[derive(JsonSchema)]` types
 //! - **Transparency**: Every applied change is a [`Correction`]; every
 //!   collision-skipped rename is a [`SkippedCorrection`]
 //! - **Multiple algorithm support**: Jaro-Winkler, Levenshtein, Damerau-Levenshtein
@@ -81,6 +84,7 @@
 pub mod distance;
 pub mod error;
 pub mod extract;
+pub mod import;
 pub mod repair;
 pub mod sanitize;
 pub mod schema;
@@ -89,6 +93,7 @@ pub mod schema;
 pub use distance::{Algorithm, Match};
 pub use error::FuzzyError;
 pub use extract::{extract_json, extract_json_blocks, strip_code_fences};
+pub use import::{ImportWarning, SchemaImport};
 pub use repair::{
     repair_enum_array, repair_fields_with_list, repair_object_fields, repair_tagged_enum,
     repair_tagged_enum_array, repair_tagged_enum_json, Correction, FuzzyOptions, RepairLog,
