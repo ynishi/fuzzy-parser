@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-22
+
 ### Added
 
 - `sanitize_json` now normalizes lenient (non-JSON) syntax in a new first
@@ -98,6 +100,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Damerau-Levenshtein) via `FuzzyOptions`.
 - `Correction` records exposing every applied repair for transparency.
 
-[Unreleased]: https://github.com/ynishi/fuzzy-parser/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/ynishi/fuzzy-parser/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ynishi/fuzzy-parser/compare/v0.3.0...v0.4.0
 [0.1.1]: https://github.com/ynishi/fuzzy-parser/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ynishi/fuzzy-parser/releases/tag/v0.1.0
