@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Schema-shape repair options on `FuzzyOptions` (all opt-in, off by default):
+  - `wrap_single_values`: wrap a single value into a one-element array when
+    the schema expects an array (`"Debug"` → `["Debug"]` for `EnumArray`, a
+    lone object for `ObjectArray` / `TaggedEnumArray`). Only values matching
+    the array's element shape are wrapped.
+  - `fill_defaults`: insert schema-defined default values for missing fields
+    (`FieldDef::default`, set via the new `with_field_default` builders on
+    `ObjectSchema` / `TaggedEnumSchema`, or imported from the JSON Schema
+    `default` keyword). Recorded as `FilledDefault` log entries.
+  - `drop_unknown_fields`: remove keys that are neither valid schema fields
+    nor fuzzy-repairable to one. Recorded as `DroppedField` log entries with
+    the removed value preserved.
+  - `coerce_types`: lossless scalar coercion can now be disabled
+    (default remains enabled, matching previous behavior).
+- `FieldDef::default` field and `FieldDef::with_default` /
+  `ObjectSchema::with_field_default` / `TaggedEnumSchema::with_field_default`
+  builders.
+- JSON Schema import now carries property-level `default` values into the
+  repair schema (previously ignored).
+- `RepairLog` / `RepairResult` gained `filled` and `dropped` lists plus
+  `has_filled()` / `has_dropped()` helpers.
+- Integration test suite (`tests/pipeline.rs`) exercising the public
+  extract → sanitize → repair pipeline end to end.
+
+### Changed
+
+- **Field-name collision policy is now best-match-win instead of first-win**:
+  when two typo keys resolve to the same candidate field, the key with the
+  highest similarity wins the rename (ties break by lexicographic key order).
+  Previously the winner depended on the map's iteration order. Literal
+  existing keys still always win; losing keys are still recorded as
+  `SkippedCorrection`s.
+- `FuzzyOptions`, `FieldDef`, `RepairLog`, and `RepairResult` gained new
+  public fields; code constructing these types with struct literals must add
+  the new fields (builder / constructor code is unaffected).
+
 ## [0.1.1] - 2026-07-10
 
 ### Fixed

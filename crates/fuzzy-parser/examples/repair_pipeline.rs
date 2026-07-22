@@ -57,7 +57,10 @@ Let me know if you need anything else."#;
         .expect("repair failed");
 
     println!("--- repaired ---");
-    println!("{}\n", serde_json::to_string_pretty(&result.repaired).unwrap());
+    println!(
+        "{}\n",
+        serde_json::to_string_pretty(&result.repaired).unwrap()
+    );
 
     println!("--- corrections ({}) ---", result.correction_count());
     for c in &result.corrections {

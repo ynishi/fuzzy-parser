@@ -77,7 +77,19 @@ assert_eq!(result.repaired["derives"][0], "Debug");     // Debg → Debug
 | `FieldKind::Bool` | `"true"` | `true` |
 | `FieldKind::String` | `42` | `"42"` |
 
-Coercion is lossless-only: unparseable values are left untouched.
+Coercion is lossless-only: unparseable values are left untouched. It can be
+disabled with `FuzzyOptions::with_coerce_types(false)`.
+
+### Schema-Shape Options (Opt-In)
+
+Three additional schema-driven repairs, all off by default and all recorded
+in the result log:
+
+| Option | Before | After | Logged as |
+|--------|--------|-------|-----------|
+| `with_wrap_single_values(true)` | `"derives": "Debug"` | `"derives": ["Debug"]` | `Correction` |
+| `with_fill_defaults(true)` | `{}` (field missing, default defined) | `{"retries": 3}` | `FilledDefault` |
+| `with_drop_unknown_fields(true)` | `{"note": "hope this helps!"}` | `{}` (value kept in log) | `DroppedField` |
 
 ### JSON Schema Import
 
@@ -103,10 +115,10 @@ are rejected with an explicit error — annotate the enum with
 
 ```toml
 [dependencies]
-fuzzy-parser = "0.3"
+fuzzy-parser = "0.4"
 
 # Optional: derive repair schemas from #[derive(JsonSchema)] types
-fuzzy-parser = { version = "0.3", features = ["schemars"] }
+fuzzy-parser = { version = "0.4", features = ["schemars"] }
 ```
 
 ## Usage
@@ -269,6 +281,39 @@ let options = FuzzyOptions::default()
     .with_algorithm(Algorithm::Levenshtein);  // default: JaroWinkler
 ```
 
+### Strict Schema-Shaped Output (Wrap / Defaults / Drop)
+
+When the repaired JSON feeds straight into `serde` deserialization, the
+opt-in shape options make the output match the schema exactly — while
+keeping every change (and every removed value) in the log:
+
+```rust
+use fuzzy_parser::{FieldKind, FuzzyOptions, ObjectSchema, TaggedEnumSchema, repair_tagged_enum_json};
+
+let schema = TaggedEnumSchema::with_tag("type").with_variant(
+    "AddDerive",
+    ObjectSchema::new(["target"])
+        .with_field_kind("derives", FieldKind::enum_array(["Debug", "Clone"]))
+        .with_field_default("visibility", serde_json::json!("pub")),
+);
+
+let options = FuzzyOptions::default()
+    .with_wrap_single_values(true)   // "Debug"  → ["Debug"]
+    .with_fill_defaults(true)        // missing "visibility" → "pub"
+    .with_drop_unknown_fields(true); // "note": "hope this helps!" → removed
+
+let json = r#"{"type": "AddDerive", "target": "User", "derives": "Debg", "note": "hope this helps!"}"#;
+let result = repair_tagged_enum_json(json, &schema, &options)?;
+
+assert_eq!(result.repaired["derives"][0], "Debug");     // wrapped + fuzzy-fixed
+assert_eq!(result.repaired["visibility"], "pub");       // filled (in result.filled)
+assert!(result.repaired.get("note").is_none());         // dropped (in result.dropped)
+```
+
+Defaults also flow in from JSON Schema / schemars: the `default` keyword on
+a property (e.g. `#[serde(default)]` + `#[schemars(default = ...)]`) is
+carried into the imported repair schema.
+
 ### Inspecting Corrections (and Skipped Corrections)
 
 Every applied change is recorded; renames that were *skipped* for collision
@@ -312,9 +357,26 @@ for skipped in &result.skipped {
    repair (repair) are independent stages
 2. **Schema-driven**: Caller defines the schema (library remains generic)
 3. **Transparency**: All corrections are recorded as `Correction` structs;
-   collision-skipped renames are recorded as `SkippedCorrection` structs
+   collision-skipped renames as `SkippedCorrection`, filled defaults as
+   `FilledDefault`, and dropped fields as `DroppedField` (removed values
+   are preserved in the log)
 4. **Safety**: No corrections made below similarity threshold; type coercion
-   is lossless-only
+   is lossless-only; lossy-leaning repairs (wrap / fill / drop) are opt-in
+   and off by default
+
+## Migrating from 0.3
+
+Most 0.3 code compiles unchanged. The differences:
+
+- **Collision policy changed from first-win to best-match-win**: when two
+  typo keys resolve to the same field, the higher-similarity key now wins
+  the rename (deterministic, independent of key order). Literal existing
+  keys still always win.
+- `FuzzyOptions`, `FieldDef`, `RepairLog`, and `RepairResult` gained new
+  public fields (`coerce_types`, `wrap_single_values`, `fill_defaults`,
+  `drop_unknown_fields` / `default` / `filled`, `dropped`). Struct-literal
+  construction needs the new fields; builder and constructor code is
+  unaffected.
 
 ## Migrating from 0.2
 

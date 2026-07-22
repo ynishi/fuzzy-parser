@@ -28,13 +28,18 @@
 //! - **Recursive schemas**: Nested objects, arrays of objects, and nested
 //!   tagged enums (e.g. arrays of DSL intents) are repaired to any depth
 //!   ([`FieldKind`])
-//! - **Type coercion**: Fix string-encoded scalars (e.g., `"42"` → `42`)
+//! - **Type coercion**: Fix string-encoded scalars (e.g., `"42"` → `42`);
+//!   can be disabled via [`FuzzyOptions`]
+//! - **Schema-shape options** (opt-in, [`FuzzyOptions`]): wrap single
+//!   values into expected arrays, fill missing fields with schema
+//!   defaults, drop unknown fields
 //! - **Dynamic schemas**: Schemas own their data and can be built at runtime
 //! - **JSON Schema import**: Derive repair schemas from JSON Schema
 //!   documents ([`TaggedEnumSchema::from_json_schema`]) or, with the
 //!   `schemars` feature, directly from `#[derive(JsonSchema)]` types
 //! - **Transparency**: Every applied change is a [`Correction`]; every
-//!   collision-skipped rename is a [`SkippedCorrection`]
+//!   collision-skipped rename is a [`SkippedCorrection`]; filled defaults
+//!   and dropped fields are [`FilledDefault`] / [`DroppedField`]
 //! - **Multiple algorithm support**: Jaro-Winkler, Levenshtein, Damerau-Levenshtein
 //! - **Configurable similarity threshold**
 //!
@@ -97,8 +102,8 @@ pub use extract::{extract_json, extract_json_blocks, strip_code_fences};
 pub use import::{ImportWarning, SchemaImport};
 pub use repair::{
     repair_enum_array, repair_fields_with_list, repair_object_fields, repair_tagged_enum,
-    repair_tagged_enum_array, repair_tagged_enum_json, Correction, FuzzyOptions, RepairLog,
-    RepairResult, SkipReason, SkippedCorrection,
+    repair_tagged_enum_array, repair_tagged_enum_json, Correction, DroppedField, FilledDefault,
+    FuzzyOptions, RepairLog, RepairResult, SkipReason, SkippedCorrection,
 };
 pub use sanitize::sanitize_json;
 pub use schema::{FieldDef, FieldKind, ObjectSchema, TaggedEnumSchema};

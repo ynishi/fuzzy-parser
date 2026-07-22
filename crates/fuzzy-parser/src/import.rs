@@ -17,7 +17,9 @@
 //!   `$ref` / `$defs` (also legacy `definitions`), including the
 //!   Draft 2020-12 sibling-`$ref` composition schemars emits for newtype
 //!   variants. `Option<T>`-style nullable wrappers
-//!   (`anyOf: [T, {type: null}]`) are unwrapped.
+//!   (`anyOf: [T, {type: null}]`) are unwrapped. Property-level `default`
+//!   values are carried into the repair schema (inserted for missing
+//!   fields only when `FuzzyOptions::fill_defaults` is enabled).
 //! - **Type mapping**: `string` → [`FieldKind::String`],
 //!   `integer` → [`FieldKind::Integer`], `number` → [`FieldKind::Number`],
 //!   `boolean` → [`FieldKind::Bool`], `object` → [`FieldKind::Object`]
@@ -33,8 +35,8 @@
 //! - **Externally tagged enums** (serde's default representation) and
 //!   **untagged enums**: rejected with an error. Annotate the enum with
 //!   `#[serde(tag = "...")]` so a tag field exists for repair to anchor on.
-//! - **`required` / `default` completion**: missing fields are not filled
-//!   in; the keywords are ignored.
+//! - **`required` completion**: fields without a `default` are never
+//!   invented; `required` itself is ignored.
 //! - Constructs with no repair semantics (`allOf`, `patternProperties`,
 //!   tuples via `prefixItems`, non-tagged `oneOf` / `anyOf` on fields,
 //!   recursive `$ref` cycles) degrade to [`FieldKind::Any`] and are
@@ -355,6 +357,11 @@ impl<'a> ImportCtx<'a> {
                 let field_path = format!("{}.properties.{}", path, name);
                 let kind = self.convert_kind(prop, &field_path);
                 schema = schema.with_field_kind(name, kind);
+                // Carry the JSON Schema `default` keyword so that
+                // `FuzzyOptions::fill_defaults` can insert it when missing.
+                if let Some(default) = prop.as_object().and_then(|p| p.get("default")) {
+                    schema = schema.with_field_default(name, default.clone());
+                }
             }
         }
         schema
@@ -374,7 +381,10 @@ impl<'a> ImportCtx<'a> {
                 return FieldKind::Any;
             }
             let Some(target) = self.lookup_ref(&reference) else {
-                self.warn(path, format!("unresolvable $ref `{}`; left as Any", reference));
+                self.warn(
+                    path,
+                    format!("unresolvable $ref `{}`; left as Any", reference),
+                );
                 return FieldKind::Any;
             };
             let merged = merge_sibling_ref(&target, obj);
@@ -532,8 +542,7 @@ fn tag_candidates(branches: &[Map<String, Value>]) -> Vec<String> {
 /// Unwrap `Option<T>`-style nullable compositions: exactly two branches,
 /// one of which is `{"type": "null"}`.
 fn nullable_unwrap(branches: &[Value]) -> Option<&Value> {
-    let is_null =
-        |v: &Value| v.get("type").and_then(Value::as_str) == Some("null");
+    let is_null = |v: &Value| v.get("type").and_then(Value::as_str) == Some("null");
     match branches {
         [a, b] if is_null(a) && !is_null(b) => Some(b),
         [a, b] if is_null(b) && !is_null(a) => Some(a),
@@ -1057,6 +1066,36 @@ mod tests {
         };
         assert_eq!(inner.kind_of("value"), Some(&FieldKind::Number));
     }
+
+    #[test]
+    fn test_import_carries_property_defaults() {
+        use crate::repair::{repair_tagged_enum_json, FuzzyOptions};
+
+        let schema_doc = json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "const": "Configure"},
+                        "name": {"type": "string"},
+                        "retries": {"type": "integer", "default": 3}
+                    }
+                }
+            ]
+        });
+
+        let import = TaggedEnumSchema::from_json_schema(&schema_doc).unwrap();
+        let variant = import.schema.variant_schema("Configure").unwrap();
+        let retries = variant.fields.iter().find(|d| d.name == "retries").unwrap();
+        assert_eq!(retries.default, Some(json!(3)));
+
+        // End to end: the default is only inserted with fill_defaults on
+        let llm_json = r#"{"type": "Configure", "name": "api"}"#;
+        let options = FuzzyOptions::default().with_fill_defaults(true);
+        let result = repair_tagged_enum_json(llm_json, &import.schema, &options).unwrap();
+        assert_eq!(result.repaired["retries"], 3);
+        assert_eq!(result.filled.len(), 1);
+    }
 }
 
 #[cfg(all(test, feature = "schemars"))]
@@ -1068,14 +1107,8 @@ mod schemars_tests {
     #[serde(tag = "type")]
     #[allow(dead_code)]
     enum Intent {
-        AddDerive {
-            target: String,
-            count: i32,
-        },
-        Rename {
-            from: String,
-            to: String,
-        },
+        AddDerive { target: String, count: i32 },
+        Rename { from: String, to: String },
     }
 
     #[test]
@@ -1093,8 +1126,7 @@ mod schemars_tests {
 
         // End to end: derive → import → repair
         let llm_json = r#"{"type": "AddDeriv", "taget": "User", "count": "3"}"#;
-        let result =
-            repair_tagged_enum_json(llm_json, schema, &FuzzyOptions::default()).unwrap();
+        let result = repair_tagged_enum_json(llm_json, schema, &FuzzyOptions::default()).unwrap();
         assert_eq!(result.repaired["type"], "AddDerive");
         assert_eq!(result.repaired["target"], "User");
         assert_eq!(result.repaired["count"], 3);

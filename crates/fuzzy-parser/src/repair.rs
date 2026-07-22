@@ -8,15 +8,20 @@
 //! Repair walks the JSON value tree guided by the schema:
 //!
 //! 1. **Field-name repair** — object keys are fuzzy-matched against the
-//!    schema's field names and renamed (collision-safe, first-win; skipped
-//!    renames are recorded as [`SkippedCorrection`]s).
+//!    schema's field names and renamed (collision-safe, best-match-win;
+//!    skipped renames are recorded as [`SkippedCorrection`]s).
 //! 2. **Value repair** — each field's value is repaired according to its
 //!    [`FieldKind`]: fuzzy correction against closed sets, recursive descent
 //!    into nested objects / arrays of objects, or scalar type coercion.
 //!
+//! Opt-in extras (all off by default, see [`FuzzyOptions`]): wrapping single
+//! values into expected arrays, filling missing fields with schema defaults,
+//! and dropping unknown fields.
+//!
 //! Every change is recorded as a [`Correction`]; every rename that was
 //! *not* applied because the target key already existed is recorded as a
-//! [`SkippedCorrection`]. Nothing is changed silently.
+//! [`SkippedCorrection`]; filled defaults and dropped fields are recorded as
+//! [`FilledDefault`] / [`DroppedField`]. Nothing is changed silently.
 
 use crate::distance::{find_closest, Algorithm};
 use crate::error::FuzzyError;
@@ -36,6 +41,41 @@ pub struct FuzzyOptions {
     ///
     /// Default: JaroWinkler (best for typos)
     pub algorithm: Algorithm,
+
+    /// Coerce string-encoded scalars toward the schema's expected type
+    /// (`"42"` → `42`, lossless only). See [`FieldKind::Integer`] et al.
+    ///
+    /// Default: `true` (matches pre-0.4 behavior)
+    pub coerce_types: bool,
+
+    /// Wrap a single value in an array when the schema expects an array
+    /// (`"Debug"` → `["Debug"]` for [`FieldKind::EnumArray`], a lone object
+    /// for [`FieldKind::ObjectArray`] / [`FieldKind::TaggedEnumArray`]).
+    ///
+    /// Only values that match the array's element shape are wrapped; the
+    /// wrap is recorded as a [`Correction`] with similarity `1.0`.
+    ///
+    /// Default: `false`
+    pub wrap_single_values: bool,
+
+    /// Insert schema-defined default values for missing fields
+    /// (see [`FieldDef::default`](crate::FieldDef) and the
+    /// `with_field_default` builders). Each insertion is recorded as a
+    /// [`FilledDefault`].
+    ///
+    /// Default: `false`
+    pub fill_defaults: bool,
+
+    /// Remove object keys that are neither valid schema fields nor
+    /// fuzzy-repairable to one. Each removal is recorded as a
+    /// [`DroppedField`] (the dropped value is preserved in the log).
+    ///
+    /// Keys whose rename was collision-skipped are also removed (they are
+    /// still unknown after the rename pass); the [`SkippedCorrection`]
+    /// remains in the log alongside the [`DroppedField`].
+    ///
+    /// Default: `false`
+    pub drop_unknown_fields: bool,
 }
 
 impl Default for FuzzyOptions {
@@ -43,6 +83,10 @@ impl Default for FuzzyOptions {
         Self {
             min_similarity: 0.7,
             algorithm: Algorithm::JaroWinkler,
+            coerce_types: true,
+            wrap_single_values: false,
+            fill_defaults: false,
+            drop_unknown_fields: false,
         }
     }
 }
@@ -57,6 +101,33 @@ impl FuzzyOptions {
     /// Create options with a custom algorithm
     pub fn with_algorithm(mut self, algorithm: Algorithm) -> Self {
         self.algorithm = algorithm;
+        self
+    }
+
+    /// Enable / disable lossless scalar type coercion (default: enabled)
+    pub fn with_coerce_types(mut self, coerce_types: bool) -> Self {
+        self.coerce_types = coerce_types;
+        self
+    }
+
+    /// Enable / disable wrapping single values into expected arrays
+    /// (default: disabled)
+    pub fn with_wrap_single_values(mut self, wrap_single_values: bool) -> Self {
+        self.wrap_single_values = wrap_single_values;
+        self
+    }
+
+    /// Enable / disable filling missing fields with schema defaults
+    /// (default: disabled)
+    pub fn with_fill_defaults(mut self, fill_defaults: bool) -> Self {
+        self.fill_defaults = fill_defaults;
+        self
+    }
+
+    /// Enable / disable dropping unknown (unrepairable) fields
+    /// (default: disabled)
+    pub fn with_drop_unknown_fields(mut self, drop_unknown_fields: bool) -> Self {
+        self.drop_unknown_fields = drop_unknown_fields;
         self
     }
 }
@@ -90,7 +161,7 @@ impl Correction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     /// The rename target key already exists in the object, so renaming
-    /// would have overwritten data (first-win collision policy).
+    /// would have overwritten data (best-match-win collision policy).
     TargetExists,
 }
 
@@ -98,7 +169,7 @@ pub enum SkipReason {
 ///
 /// Recorded when a typo key resolves to a candidate field name but the
 /// candidate already exists in the object (either as a literal key or
-/// because an earlier typo key won the rename). See
+/// because a higher-similarity typo key won the rename). See
 /// [`repair_fields_with_list`] for the collision policy.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkippedCorrection {
@@ -114,6 +185,33 @@ pub struct SkippedCorrection {
     pub reason: SkipReason,
 }
 
+/// A missing field that was filled with its schema-defined default value.
+///
+/// Recorded only when [`FuzzyOptions::fill_defaults`] is enabled.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilledDefault {
+    /// The field name that was inserted
+    pub field: String,
+    /// The default value that was inserted
+    pub value: Value,
+    /// JSON path to the inserted field (e.g., "$.retries")
+    pub field_path: String,
+}
+
+/// An unknown field that was removed from the object.
+///
+/// Recorded only when [`FuzzyOptions::drop_unknown_fields`] is enabled.
+/// The removed value is preserved here, so nothing is lost silently.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DroppedField {
+    /// The key that was removed
+    pub field: String,
+    /// The value the key held when it was removed
+    pub value: Value,
+    /// JSON path to the removed field (e.g., "$.extraneous")
+    pub field_path: String,
+}
+
 /// Accumulated log of a repair pass: applied and skipped corrections.
 #[derive(Debug, Clone, Default)]
 pub struct RepairLog {
@@ -121,6 +219,10 @@ pub struct RepairLog {
     pub corrections: Vec<Correction>,
     /// Corrections that were found but skipped (collision safety)
     pub skipped: Vec<SkippedCorrection>,
+    /// Missing fields filled with schema defaults ([`FuzzyOptions::fill_defaults`])
+    pub filled: Vec<FilledDefault>,
+    /// Unknown fields removed ([`FuzzyOptions::drop_unknown_fields`])
+    pub dropped: Vec<DroppedField>,
 }
 
 impl RepairLog {
@@ -139,10 +241,22 @@ impl RepairLog {
         !self.skipped.is_empty()
     }
 
+    /// Check if any defaults were filled in
+    pub fn has_filled(&self) -> bool {
+        !self.filled.is_empty()
+    }
+
+    /// Check if any unknown fields were dropped
+    pub fn has_dropped(&self) -> bool {
+        !self.dropped.is_empty()
+    }
+
     /// Merge another log into this one
     pub fn merge(&mut self, other: RepairLog) {
         self.corrections.extend(other.corrections);
         self.skipped.extend(other.skipped);
+        self.filled.extend(other.filled);
+        self.dropped.extend(other.dropped);
     }
 }
 
@@ -155,6 +269,10 @@ pub struct RepairResult {
     pub corrections: Vec<Correction>,
     /// List of corrections that were found but skipped (collision safety)
     pub skipped: Vec<SkippedCorrection>,
+    /// Missing fields filled with schema defaults ([`FuzzyOptions::fill_defaults`])
+    pub filled: Vec<FilledDefault>,
+    /// Unknown fields removed ([`FuzzyOptions::drop_unknown_fields`])
+    pub dropped: Vec<DroppedField>,
 }
 
 impl RepairResult {
@@ -172,6 +290,16 @@ impl RepairResult {
     pub fn has_skipped(&self) -> bool {
         !self.skipped.is_empty()
     }
+
+    /// Check if any defaults were filled in
+    pub fn has_filled(&self) -> bool {
+        !self.filled.is_empty()
+    }
+
+    /// Check if any unknown fields were dropped
+    pub fn has_dropped(&self) -> bool {
+        !self.dropped.is_empty()
+    }
 }
 
 // ============================================================================
@@ -185,7 +313,7 @@ impl RepairResult {
 /// 2. Field values according to each field's [`FieldKind`] — recursing
 ///    into nested objects and arrays of objects to any depth
 ///
-/// # Collision behavior (first-win)
+/// # Collision behavior (best-match-win)
 ///
 /// See [`repair_fields_with_list`]. Skipped renames are recorded in the
 /// returned log's `skipped` list.
@@ -198,22 +326,29 @@ pub fn repair_object_fields(
     let mut log = RepairLog::default();
     let valid_fields: Vec<&str> = schema.field_names().collect();
     repair_field_names_into(obj, &valid_fields, None, path, options, &mut log);
+    fill_missing_defaults(obj, &schema.fields, path, options, &mut log);
     apply_field_kinds(obj, &schema.fields, path, options, &mut log);
     log
 }
 
 /// Repair field names in a JSON object using a field list
 ///
-/// # Collision behavior (first-win)
+/// # Collision behavior (best-match-win)
 ///
 /// A key is only renamed when the target field does not already exist in the
 /// object. This guards against destroying data: if two typo keys resolve to
-/// the same candidate, the first one processed wins and the later key is left
-/// unchanged (recorded as a [`SkippedCorrection`] with
-/// [`SkipReason::TargetExists`]). The same applies when the candidate is
-/// already present as a literal key. Keys are processed in the object's
-/// iteration order (for `serde_json::Map` this is sorted key order by
-/// default, or insertion order with the `preserve_order` feature).
+/// the same candidate, the key with the **highest similarity** wins (ties
+/// broken by lexicographic key order, so the outcome is deterministic and
+/// independent of the map's iteration order). The losing key is left
+/// unchanged and recorded as a [`SkippedCorrection`] with
+/// [`SkipReason::TargetExists`]. The same applies when the candidate is
+/// already present as a literal key — literal keys always win.
+///
+/// # Unknown fields
+///
+/// With [`FuzzyOptions::drop_unknown_fields`] enabled, keys that are still
+/// unknown after the rename pass (no candidate above the threshold, or
+/// collision-skipped) are removed and recorded as [`DroppedField`]s.
 pub fn repair_fields_with_list(
     obj: &mut Map<String, Value>,
     valid_fields: &[&str],
@@ -225,7 +360,7 @@ pub fn repair_fields_with_list(
     log
 }
 
-/// Core field-name rename pass (collision-safe, first-win).
+/// Core field-name rename pass (collision-safe, best-match-win).
 fn repair_field_names_into(
     obj: &mut Map<String, Value>,
     valid_fields: &[&str],
@@ -234,39 +369,93 @@ fn repair_field_names_into(
     options: &FuzzyOptions,
     log: &mut RepairLog,
 ) {
-    // Collect keys that need correction
-    let keys_to_check: Vec<String> = obj
-        .keys()
-        .filter(|k| Some(k.as_str()) != skip_key && !valid_fields.contains(&k.as_str()))
-        .cloned()
-        .collect();
-
-    // Process each invalid key
-    for key in keys_to_check {
+    // Collect keys that need correction, with their best candidate (if any)
+    let mut matched: Vec<(String, crate::distance::Match)> = Vec::new();
+    for key in obj.keys() {
+        if Some(key.as_str()) == skip_key || valid_fields.contains(&key.as_str()) {
+            continue;
+        }
         if let Some(m) = find_closest(
-            &key,
+            key,
             valid_fields.iter().copied(),
             options.min_similarity,
             options.algorithm,
         ) {
-            // Only correct if the target field doesn't already exist
-            if !obj.contains_key(&m.candidate) {
-                if let Some(val) = obj.remove(&key) {
-                    log.corrections.push(Correction::new(
-                        key.clone(),
-                        m.candidate.clone(),
-                        m.similarity,
-                        format!("{}.{}", path, key),
-                    ));
-                    obj.insert(m.candidate, val);
-                }
-            } else {
-                log.skipped.push(SkippedCorrection {
-                    original: key.clone(),
-                    candidate: m.candidate,
-                    similarity: m.similarity,
+            matched.push((key.clone(), m));
+        }
+    }
+
+    // Best-match-win: process higher similarity first so that when two typo
+    // keys resolve to the same candidate, the closer one gets the rename.
+    // Ties break by key order — deterministic regardless of map order.
+    matched.sort_by(|(ka, ma), (kb, mb)| {
+        mb.similarity
+            .partial_cmp(&ma.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| ka.cmp(kb))
+    });
+
+    for (key, m) in matched {
+        // Only correct if the target field doesn't already exist
+        if !obj.contains_key(&m.candidate) {
+            if let Some(val) = obj.remove(&key) {
+                log.corrections.push(Correction::new(
+                    key.clone(),
+                    m.candidate.clone(),
+                    m.similarity,
+                    format!("{}.{}", path, key),
+                ));
+                obj.insert(m.candidate, val);
+            }
+        } else {
+            log.skipped.push(SkippedCorrection {
+                original: key.clone(),
+                candidate: m.candidate,
+                similarity: m.similarity,
+                field_path: format!("{}.{}", path, key),
+                reason: SkipReason::TargetExists,
+            });
+        }
+    }
+
+    // Optionally drop keys that are still unknown after the rename pass
+    if options.drop_unknown_fields {
+        let to_drop: Vec<String> = obj
+            .keys()
+            .filter(|k| Some(k.as_str()) != skip_key && !valid_fields.contains(&k.as_str()))
+            .cloned()
+            .collect();
+        for key in to_drop {
+            if let Some(value) = obj.remove(&key) {
+                log.dropped.push(DroppedField {
+                    field: key.clone(),
+                    value,
                     field_path: format!("{}.{}", path, key),
-                    reason: SkipReason::TargetExists,
+                });
+            }
+        }
+    }
+}
+
+/// Insert schema defaults for missing fields (when `fill_defaults` is on).
+fn fill_missing_defaults(
+    obj: &mut Map<String, Value>,
+    fields: &[FieldDef],
+    path: &str,
+    options: &FuzzyOptions,
+    log: &mut RepairLog,
+) {
+    if !options.fill_defaults {
+        return;
+    }
+    for def in fields {
+        if let Some(default) = &def.default {
+            if !obj.contains_key(&def.name) {
+                obj.insert(def.name.clone(), default.clone());
+                log.filled.push(FilledDefault {
+                    field: def.name.clone(),
+                    value: default.clone(),
+                    field_path: format!("{}.{}", path, def.name),
                 });
             }
         }
@@ -320,6 +509,9 @@ fn apply_kind(
             }
         }
         FieldKind::EnumArray(valid_values) => {
+            if options.wrap_single_values {
+                wrap_single_into_array(value, Value::is_string, path, log);
+            }
             if let Value::Array(arr) = value {
                 let valid: Vec<&str> = valid_values.iter().map(|v| v.as_str()).collect();
                 let arr_log = repair_enum_array(arr, &valid, path, options);
@@ -333,6 +525,9 @@ fn apply_kind(
             }
         }
         FieldKind::ObjectArray(schema) => {
+            if options.wrap_single_values {
+                wrap_single_into_array(value, Value::is_object, path, log);
+            }
             if let Value::Array(arr) = value {
                 for (i, item) in arr.iter_mut().enumerate() {
                     if let Value::Object(nested) = item {
@@ -350,15 +545,44 @@ fn apply_kind(
             }
         }
         FieldKind::TaggedEnumArray(schema) => {
+            if options.wrap_single_values {
+                wrap_single_into_array(value, Value::is_object, path, log);
+            }
             if let Value::Array(arr) = value {
                 let arr_log = repair_tagged_enum_array(arr, schema, path, options);
                 log.merge(arr_log);
             }
         }
         FieldKind::Integer | FieldKind::Number | FieldKind::Bool | FieldKind::String => {
-            coerce_value(value, kind, path, log);
+            if options.coerce_types {
+                coerce_value(value, kind, path, log);
+            }
         }
     }
+}
+
+/// Wrap a single value into a one-element array when the schema expects an
+/// array and the value matches the array's element shape.
+///
+/// Recorded as a [`Correction`] with similarity `1.0` (like coercions).
+fn wrap_single_into_array(
+    value: &mut Value,
+    element_matches: impl Fn(&Value) -> bool,
+    path: &str,
+    log: &mut RepairLog,
+) {
+    if value.is_array() || value.is_null() || !element_matches(value) {
+        return;
+    }
+    let original = value.to_string();
+    let single = std::mem::take(value);
+    *value = Value::Array(vec![single]);
+    log.corrections.push(Correction::new(
+        original,
+        value.to_string(),
+        1.0,
+        path.to_string(),
+    ));
 }
 
 /// Coerce a scalar value toward the expected type (lossless only).
@@ -407,12 +631,12 @@ fn coerce_value(value: &mut Value, kind: &FieldKind, path: &str, log: &mut Repai
 ///    objects (recursively, to any depth), arrays of objects, and scalar
 ///    type coercion
 ///
-/// # Collision behavior (first-win)
+/// # Collision behavior (best-match-win)
 ///
 /// Field-name repair never overwrites an existing key: when two typo keys
-/// resolve to the same candidate, only the first is renamed and the later one
-/// is recorded as a [`SkippedCorrection`]. See [`repair_fields_with_list`]
-/// for details.
+/// resolve to the same candidate, the higher-similarity key is renamed and
+/// the other is recorded as a [`SkippedCorrection`]. See
+/// [`repair_fields_with_list`] for details.
 pub fn repair_tagged_enum(
     obj: &mut Map<String, Value>,
     schema: &TaggedEnumSchema,
@@ -437,10 +661,7 @@ pub fn repair_tagged_enum(
                     m.similarity,
                     format!("{}.{}", path, schema.tag_field),
                 ));
-                obj.insert(
-                    schema.tag_field.clone(),
-                    Value::String(m.candidate.clone()),
-                );
+                obj.insert(schema.tag_field.clone(), Value::String(m.candidate.clone()));
                 m.candidate
             } else {
                 tag_val.to_string()
@@ -454,7 +675,9 @@ pub fn repair_tagged_enum(
 
     // Step 2: Repair field names (variant fields + global fields)
     let variant = schema.variant_schema(&tag_value);
-    let mut valid_fields: Vec<&str> = variant.map(|s| s.field_names().collect()).unwrap_or_default();
+    let mut valid_fields: Vec<&str> = variant
+        .map(|s| s.field_names().collect())
+        .unwrap_or_default();
     for def in &schema.global_fields {
         if !valid_fields.contains(&def.name.as_str()) {
             valid_fields.push(def.name.as_str());
@@ -471,12 +694,18 @@ pub fn repair_tagged_enum(
         );
     }
 
-    // Step 3: Apply variant field kinds (recursive)
+    // Step 3: Fill missing fields with schema defaults (opt-in)
+    if let Some(variant) = variant {
+        fill_missing_defaults(obj, &variant.fields, path, options, &mut log);
+    }
+    fill_missing_defaults(obj, &schema.global_fields, path, options, &mut log);
+
+    // Step 4: Apply variant field kinds (recursive)
     if let Some(variant) = variant {
         apply_field_kinds(obj, &variant.fields, path, options, &mut log);
     }
 
-    // Step 4: Apply global field kinds (enum arrays, nested objects, coercion)
+    // Step 5: Apply global field kinds (enum arrays, nested objects, coercion)
     apply_field_kinds(obj, &schema.global_fields, path, options, &mut log);
 
     log
@@ -535,6 +764,8 @@ pub fn repair_tagged_enum_json(
         repaired: value,
         corrections: log.corrections,
         skipped: log.skipped,
+        filled: log.filled,
+        dropped: log.dropped,
     })
 }
 
@@ -568,11 +799,10 @@ mod tests {
     #[test]
     #[allow(clippy::needless_borrows_for_generic_args)]
     fn test_v01_call_style_still_compiles() {
-        let schema = TaggedEnumSchema::new("type", &["AddDerive"], |_| {
-            Some(&["target", "derives"][..])
-        })
-        .with_enum_array("derives", &["Debug", "Clone"])
-        .with_nested_object("config", &["timeout"]);
+        let schema =
+            TaggedEnumSchema::new("type", &["AddDerive"], |_| Some(&["target", "derives"][..]))
+                .with_enum_array("derives", &["Debug", "Clone"])
+                .with_nested_object("config", &["timeout"]);
         let object_schema = ObjectSchema::new(&["name", "value"]);
 
         assert!(schema.is_valid_tag("AddDerive"));
@@ -764,8 +994,8 @@ mod tests {
     #[test]
     fn test_collision_skip_is_recorded() {
         // Two typo keys ("taget", "targt") both resolve to "target".
-        // First-win: the first key processed is renamed; the second is left
-        // unchanged and recorded as a SkippedCorrection.
+        // Best-match-win: the higher-similarity key ("targt") is renamed;
+        // the other is left unchanged and recorded as a SkippedCorrection.
         let json = r#"{"type": "AddDerive", "taget": "User", "targt": "Post"}"#;
         let schema = test_schema();
         let options = FuzzyOptions::default();
@@ -773,17 +1003,19 @@ mod tests {
         let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
 
         // Exactly one key won the rename; the other survives verbatim.
-        assert_eq!(result.repaired["target"], "User");
-        assert_eq!(result.repaired["targt"], "Post");
-        assert!(result.repaired.get("taget").is_none());
+        assert_eq!(result.repaired["target"], "Post");
+        assert_eq!(result.repaired["taget"], "User");
+        assert!(result.repaired.get("targt").is_none());
         assert_eq!(result.corrections.len(), 1);
-        assert_eq!(result.corrections[0].original, "taget");
+        assert_eq!(result.corrections[0].original, "targt");
         assert_eq!(result.corrections[0].corrected, "target");
         // The losing key is recorded as skipped
         assert_eq!(result.skipped.len(), 1);
-        assert_eq!(result.skipped[0].original, "targt");
+        assert_eq!(result.skipped[0].original, "taget");
         assert_eq!(result.skipped[0].candidate, "target");
         assert_eq!(result.skipped[0].reason, SkipReason::TargetExists);
+        // The winner's similarity is >= the loser's (best-match-win invariant)
+        assert!(result.corrections[0].similarity >= result.skipped[0].similarity);
     }
 
     #[test]
@@ -844,8 +1076,7 @@ mod tests {
             "name": "api",
             "config": {"host": "x", "server": {"prot": 80, "limits": {"max_con": 10, "timout": 5}}}
         }"#;
-        let result =
-            repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
 
         let server = &result.repaired["config"]["server"];
         assert_eq!(server["port"], 80);
@@ -879,8 +1110,7 @@ mod tests {
                 {"name": "b", "knd": "dirr"}
             ]
         }"#;
-        let result =
-            repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
 
         assert_eq!(result.repaired["items"][0]["name"], "a");
         assert_eq!(result.repaired["items"][0]["kind"], "file");
@@ -901,8 +1131,7 @@ mod tests {
         );
 
         let json = r#"{"type": "SetLevel", "level": "inof"}"#;
-        let result =
-            repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
 
         assert_eq!(result.repaired["level"], "info");
         assert_eq!(result.corrections.len(), 1);
@@ -926,8 +1155,7 @@ mod tests {
             "enabled": "true",
             "label": 42
         }"#;
-        let result =
-            repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
 
         assert_eq!(result.repaired["timeout"], 30);
         assert_eq!(result.repaired["rate"], 0.5);
@@ -948,8 +1176,7 @@ mod tests {
         );
 
         let json = r#"{"type": "Configure", "timeout": "soon", "enabled": "maybe"}"#;
-        let result =
-            repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
 
         assert_eq!(result.repaired["timeout"], "soon");
         assert_eq!(result.repaired["enabled"], "maybe");
@@ -964,8 +1191,7 @@ mod tests {
         );
 
         let json = r#"{"type": "Configure", "timeout": 30}"#;
-        let result =
-            repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
 
         assert_eq!(result.repaired["timeout"], 30);
         assert!(!result.has_corrections());
@@ -981,8 +1207,7 @@ mod tests {
         }
 
         let json = r#"{"kind": "Creat", "nme": "x", "pth": "/tmp"}"#;
-        let result =
-            repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
 
         assert_eq!(result.repaired["kind"], "Create");
         assert!(result.repaired.get("name").is_some());
@@ -1007,8 +1232,7 @@ mod tests {
             "name": "x",
             "action": {"kind": "Mve", "frm": "/a", "to": "/b"}
         }"#;
-        let result =
-            repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
 
         assert_eq!(result.repaired["action"]["kind"], "Move");
         assert!(result.repaired["action"].get("from").is_some());
@@ -1038,8 +1262,7 @@ mod tests {
                 {"type": "Renme", "from": "a", "too": "b"}
             ]
         }"#;
-        let result =
-            repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
 
         assert_eq!(result.repaired["intents"][0]["type"], "AddDerive");
         assert!(result.repaired["intents"][0].get("target").is_some());
@@ -1050,6 +1273,232 @@ mod tests {
             .corrections
             .iter()
             .any(|c| c.field_path.starts_with("$.intents[1]")));
+    }
+
+    // ------------------------------------------------------------------
+    // New in 0.4: coercion toggle, single-value wrap, defaults, drop
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_coerce_types_disabled() {
+        let schema = TaggedEnumSchema::with_tag("type").with_variant(
+            "Configure",
+            ObjectSchema::empty().with_field_kind("timeout", FieldKind::Integer),
+        );
+
+        let json = r#"{"type": "Configure", "timeout": "30"}"#;
+        let options = FuzzyOptions::default().with_coerce_types(false);
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        // String stays a string when coercion is off
+        assert_eq!(result.repaired["timeout"], "30");
+        assert!(!result.has_corrections());
+    }
+
+    #[test]
+    fn test_wrap_single_value_into_enum_array() {
+        let schema =
+            TaggedEnumSchema::new("type", &["AddDerive"], |_| Some(&["target", "derives"][..]))
+                .with_enum_array("derives", ["Debug", "Clone"]);
+
+        // LLM emitted a lone string (with a typo) where an array was expected
+        let json = r#"{"type": "AddDerive", "target": "User", "derives": "Debg"}"#;
+        let options = FuzzyOptions::default().with_wrap_single_values(true);
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        assert_eq!(result.repaired["derives"], serde_json::json!(["Debug"]));
+        // Two corrections: the wrap and the fuzzy fix inside the array
+        assert_eq!(result.corrections.len(), 2);
+    }
+
+    #[test]
+    fn test_wrap_single_value_into_object_array() {
+        let schema = TaggedEnumSchema::with_tag("type").with_variant(
+            "Batch",
+            ObjectSchema::empty()
+                .with_field_kind("items", FieldKind::ObjectArray(ObjectSchema::new(["name"]))),
+        );
+
+        let json = r#"{"type": "Batch", "items": {"nam": "a"}}"#;
+        let options = FuzzyOptions::default().with_wrap_single_values(true);
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        assert_eq!(result.repaired["items"][0]["name"], "a");
+    }
+
+    #[test]
+    fn test_wrap_single_value_shape_mismatch_left_untouched() {
+        let schema = TaggedEnumSchema::new("type", &["AddDerive"], |_| Some(&["derives"][..]))
+            .with_enum_array("derives", ["Debug"]);
+
+        // A number does not match the enum array's element shape — no wrap
+        let json = r#"{"type": "AddDerive", "derives": 42}"#;
+        let options = FuzzyOptions::default().with_wrap_single_values(true);
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        assert_eq!(result.repaired["derives"], 42);
+        assert!(!result.has_corrections());
+    }
+
+    #[test]
+    fn test_wrap_disabled_by_default() {
+        let schema = TaggedEnumSchema::new("type", &["AddDerive"], |_| Some(&["derives"][..]))
+            .with_enum_array("derives", ["Debug"]);
+
+        let json = r#"{"type": "AddDerive", "derives": "Debug"}"#;
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+
+        // Default options: single value is left as-is
+        assert_eq!(result.repaired["derives"], "Debug");
+    }
+
+    #[test]
+    fn test_fill_defaults_inserts_missing_field() {
+        let schema = TaggedEnumSchema::with_tag("type").with_variant(
+            "Configure",
+            ObjectSchema::new(["name"])
+                .with_field_kind("retries", FieldKind::Integer)
+                .with_field_default("retries", serde_json::json!(3)),
+        );
+
+        let json = r#"{"type": "Configure", "name": "api"}"#;
+        let options = FuzzyOptions::default().with_fill_defaults(true);
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        assert_eq!(result.repaired["retries"], 3);
+        assert_eq!(result.filled.len(), 1);
+        assert_eq!(result.filled[0].field, "retries");
+        assert_eq!(result.filled[0].field_path, "$.retries");
+        // A filled default is not a correction
+        assert!(!result.has_corrections());
+    }
+
+    #[test]
+    fn test_fill_defaults_does_not_overwrite_present_field() {
+        let schema = TaggedEnumSchema::with_tag("type").with_variant(
+            "Configure",
+            ObjectSchema::empty().with_field_default("retries", serde_json::json!(3)),
+        );
+
+        let json = r#"{"type": "Configure", "retries": 7}"#;
+        let options = FuzzyOptions::default().with_fill_defaults(true);
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        assert_eq!(result.repaired["retries"], 7);
+        assert!(!result.has_filled());
+    }
+
+    #[test]
+    fn test_fill_defaults_off_by_default() {
+        let schema = TaggedEnumSchema::with_tag("type").with_variant(
+            "Configure",
+            ObjectSchema::empty().with_field_default("retries", serde_json::json!(3)),
+        );
+
+        let json = r#"{"type": "Configure"}"#;
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+
+        assert!(result.repaired.get("retries").is_none());
+        assert!(!result.has_filled());
+    }
+
+    #[test]
+    fn test_fill_defaults_applies_after_rename() {
+        // A typo key renames onto the defaulted field first, so no fill happens
+        let schema = TaggedEnumSchema::with_tag("type").with_variant(
+            "Configure",
+            ObjectSchema::new(["retries"]).with_field_default("retries", serde_json::json!(3)),
+        );
+
+        let json = r#"{"type": "Configure", "retres": 7}"#;
+        let options = FuzzyOptions::default().with_fill_defaults(true);
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        assert_eq!(result.repaired["retries"], 7);
+        assert!(!result.has_filled());
+        assert_eq!(result.corrections.len(), 1);
+    }
+
+    #[test]
+    fn test_drop_unknown_fields() {
+        let schema = test_schema();
+
+        // "commentary" matches nothing; "taget" is repairable
+        let json = r#"{"type": "AddDerive", "taget": "User", "commentary": "sure, here you go"}"#;
+        let options = FuzzyOptions::default().with_drop_unknown_fields(true);
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        assert_eq!(result.repaired["target"], "User");
+        assert!(result.repaired.get("commentary").is_none());
+        assert_eq!(result.dropped.len(), 1);
+        assert_eq!(result.dropped[0].field, "commentary");
+        // The dropped value is preserved in the log
+        assert_eq!(result.dropped[0].value, "sure, here you go");
+    }
+
+    #[test]
+    fn test_drop_unknown_keeps_tag_and_valid_fields() {
+        let schema = test_schema();
+
+        let json = r#"{"type": "AddDerive", "target": "User", "derives": ["Debug"]}"#;
+        let options = FuzzyOptions::default().with_drop_unknown_fields(true);
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        assert_eq!(result.repaired["type"], "AddDerive");
+        assert_eq!(result.repaired["target"], "User");
+        assert!(!result.has_dropped());
+    }
+
+    #[test]
+    fn test_drop_unknown_fields_off_by_default() {
+        let schema = test_schema();
+
+        let json = r#"{"type": "AddDerive", "target": "User", "commentary": "x"}"#;
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+
+        assert_eq!(result.repaired["commentary"], "x");
+        assert!(!result.has_dropped());
+    }
+
+    #[test]
+    fn test_drop_removes_collision_skipped_key() {
+        // "taget" loses the rename race against the literal "target" key;
+        // with drop_unknown_fields it is then removed (skip still recorded).
+        let json = r#"{"type": "AddDerive", "target": "User", "taget": "Post"}"#;
+        let schema = test_schema();
+        let options = FuzzyOptions::default().with_drop_unknown_fields(true);
+
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        assert_eq!(result.repaired["target"], "User");
+        assert!(result.repaired.get("taget").is_none());
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.dropped.len(), 1);
+        assert_eq!(result.dropped[0].field, "taget");
+    }
+
+    #[test]
+    fn test_collision_deterministic_regardless_of_key_order() {
+        // Same pair of typo keys in both lexicographic orders must produce
+        // the same winner (best-match-win, not map-order-win).
+        let schema = test_schema();
+        let options = FuzzyOptions::default();
+
+        let a = repair_tagged_enum_json(
+            r#"{"type": "AddDerive", "taget": "A", "targt": "B"}"#,
+            &schema,
+            &options,
+        )
+        .unwrap();
+        let b = repair_tagged_enum_json(
+            r#"{"type": "AddDerive", "targt": "B", "taget": "A"}"#,
+            &schema,
+            &options,
+        )
+        .unwrap();
+
+        assert_eq!(a.repaired["target"], b.repaired["target"]);
+        assert_eq!(a.corrections[0].original, b.corrections[0].original);
     }
 
     #[test]
@@ -1067,8 +1516,7 @@ mod tests {
         );
 
         let json = r#"{"type": "AddDerive", "target": "User", "config": {"derives": ["Debg"]}}"#;
-        let result =
-            repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
 
         assert_eq!(result.repaired["config"]["derives"][0], "Debug");
         assert_eq!(result.corrections.len(), 1);

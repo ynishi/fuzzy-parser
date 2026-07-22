@@ -20,6 +20,8 @@
 //! (e.g. from a config file or an API definition), not only from `'static`
 //! literals.
 
+use serde_json::Value;
+
 /// Expected shape of a single field value.
 ///
 /// After a field's *name* has been repaired, its `FieldKind` decides what
@@ -94,15 +96,27 @@ pub struct FieldDef {
     pub name: String,
     /// The expected shape of the field's value.
     pub kind: FieldKind,
+    /// Default value inserted when the field is missing — only when
+    /// [`FuzzyOptions::fill_defaults`](crate::FuzzyOptions) is enabled.
+    /// `None` means the field is never filled in.
+    pub default: Option<Value>,
 }
 
 impl FieldDef {
-    /// Create a new field definition.
+    /// Create a new field definition (no default value).
     pub fn new(name: impl AsRef<str>, kind: FieldKind) -> Self {
         Self {
             name: name.as_ref().to_string(),
             kind,
+            default: None,
         }
+    }
+
+    /// Set the default value used by
+    /// [`FuzzyOptions::fill_defaults`](crate::FuzzyOptions).
+    pub fn with_default(mut self, value: Value) -> Self {
+        self.default = Some(value);
+        self
     }
 }
 
@@ -170,6 +184,23 @@ impl ObjectSchema {
         self
     }
 
+    /// Set a default value for a field (creating the field with
+    /// [`FieldKind::Any`] if it is not defined yet).
+    ///
+    /// The default is only inserted when
+    /// [`FuzzyOptions::fill_defaults`](crate::FuzzyOptions) is enabled and
+    /// the field is missing from the repaired object.
+    pub fn with_field_default(mut self, name: impl AsRef<str>, value: Value) -> Self {
+        let name = name.as_ref();
+        if let Some(def) = self.fields.iter_mut().find(|d| d.name == name) {
+            def.default = Some(value);
+        } else {
+            self.fields
+                .push(FieldDef::new(name, FieldKind::Any).with_default(value));
+        }
+        self
+    }
+
     /// Check if a field name is valid.
     pub fn is_valid_field(&self, field: &str) -> bool {
         self.fields.iter().any(|d| d.name == field)
@@ -182,7 +213,10 @@ impl ObjectSchema {
 
     /// Get the expected value shape for a field, if defined.
     pub fn kind_of(&self, field: &str) -> Option<&FieldKind> {
-        self.fields.iter().find(|d| d.name == field).map(|d| &d.kind)
+        self.fields
+            .iter()
+            .find(|d| d.name == field)
+            .map(|d| &d.kind)
     }
 }
 
@@ -342,6 +376,23 @@ impl TaggedEnumSchema {
         self
     }
 
+    /// Set a default value for a global field (creating the field with
+    /// [`FieldKind::Any`] if it is not defined yet).
+    ///
+    /// Global fields apply to every variant. The default is only inserted
+    /// when [`FuzzyOptions::fill_defaults`](crate::FuzzyOptions) is enabled
+    /// and the field is missing from the repaired object.
+    pub fn with_field_default(mut self, field: impl AsRef<str>, value: Value) -> Self {
+        let field = field.as_ref();
+        if let Some(def) = self.global_fields.iter_mut().find(|d| d.name == field) {
+            def.default = Some(value);
+        } else {
+            self.global_fields
+                .push(FieldDef::new(field, FieldKind::Any).with_default(value));
+        }
+        self
+    }
+
     /// Check if a tag value is valid
     pub fn is_valid_tag(&self, tag: &str) -> bool {
         self.variants.iter().any(|(t, _)| t == tag)
@@ -402,13 +453,15 @@ mod tests {
         }
 
         assert!(schema.is_valid_tag("Create"));
-        assert!(schema.variant_schema("Delete").unwrap().is_valid_field("path"));
+        assert!(schema
+            .variant_schema("Delete")
+            .unwrap()
+            .is_valid_field("path"));
     }
 
     #[test]
     fn test_with_field_kind_replaces_existing() {
-        let schema = ObjectSchema::new(["timeout"])
-            .with_field_kind("timeout", FieldKind::Integer);
+        let schema = ObjectSchema::new(["timeout"]).with_field_kind("timeout", FieldKind::Integer);
 
         assert_eq!(schema.fields.len(), 1);
         assert_eq!(schema.kind_of("timeout"), Some(&FieldKind::Integer));
