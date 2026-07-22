@@ -25,6 +25,7 @@
 
 use crate::distance::{find_closest, Algorithm};
 use crate::error::FuzzyError;
+use crate::sanitize::{detect_duplicate_keys, DuplicateKey};
 use crate::schema::{FieldDef, FieldKind, ObjectSchema, TaggedEnumSchema};
 use serde_json::{Map, Number, Value};
 
@@ -58,6 +59,19 @@ pub struct FuzzyOptions {
     /// Default: `false`
     pub wrap_single_values: bool,
 
+    /// Unwrap a one-element array when the schema expects a single value
+    /// (`["Debug"]` → `"Debug"` for [`FieldKind::Enum`], a one-object array
+    /// for [`FieldKind::Object`] / [`FieldKind::TaggedEnum`], one-scalar
+    /// arrays for the coercion kinds). The reverse of
+    /// [`wrap_single_values`](Self::wrap_single_values).
+    ///
+    /// Only one-element arrays whose element matches the expected shape are
+    /// unwrapped; the unwrap is recorded as a [`Correction`] with
+    /// similarity `1.0`.
+    ///
+    /// Default: `false`
+    pub unwrap_singleton_arrays: bool,
+
     /// Insert schema-defined default values for missing fields
     /// (see [`FieldDef::default`](crate::FieldDef) and the
     /// `with_field_default` builders). Each insertion is recorded as a
@@ -85,6 +99,7 @@ impl Default for FuzzyOptions {
             algorithm: Algorithm::JaroWinkler,
             coerce_types: true,
             wrap_single_values: false,
+            unwrap_singleton_arrays: false,
             fill_defaults: false,
             drop_unknown_fields: false,
         }
@@ -114,6 +129,13 @@ impl FuzzyOptions {
     /// (default: disabled)
     pub fn with_wrap_single_values(mut self, wrap_single_values: bool) -> Self {
         self.wrap_single_values = wrap_single_values;
+        self
+    }
+
+    /// Enable / disable unwrapping one-element arrays into expected single
+    /// values (default: disabled)
+    pub fn with_unwrap_singleton_arrays(mut self, unwrap_singleton_arrays: bool) -> Self {
+        self.unwrap_singleton_arrays = unwrap_singleton_arrays;
         self
     }
 
@@ -273,6 +295,9 @@ pub struct RepairResult {
     pub filled: Vec<FilledDefault>,
     /// Unknown fields removed ([`FuzzyOptions::drop_unknown_fields`])
     pub dropped: Vec<DroppedField>,
+    /// Duplicate keys detected in the *input text* (always populated by
+    /// [`repair_tagged_enum_json`]; `serde_json` keeps the last occurrence)
+    pub duplicates: Vec<DuplicateKey>,
 }
 
 impl RepairResult {
@@ -299,6 +324,11 @@ impl RepairResult {
     /// Check if any unknown fields were dropped
     pub fn has_dropped(&self) -> bool {
         !self.dropped.is_empty()
+    }
+
+    /// Check if any duplicate keys were detected in the input
+    pub fn has_duplicates(&self) -> bool {
+        !self.duplicates.is_empty()
     }
 }
 
@@ -489,6 +519,9 @@ fn apply_kind(
     match kind {
         FieldKind::Any => {}
         FieldKind::Enum(valid_values) => {
+            if options.unwrap_singleton_arrays {
+                unwrap_singleton_array(value, Value::is_string, path, log);
+            }
             if let Value::String(s) = value {
                 if !valid_values.iter().any(|v| v == s) {
                     if let Some(m) = find_closest(
@@ -519,6 +552,9 @@ fn apply_kind(
             }
         }
         FieldKind::Object(schema) => {
+            if options.unwrap_singleton_arrays {
+                unwrap_singleton_array(value, Value::is_object, path, log);
+            }
             if let Value::Object(nested) = value {
                 let nested_log = repair_object_fields(nested, schema, path, options);
                 log.merge(nested_log);
@@ -539,6 +575,9 @@ fn apply_kind(
             }
         }
         FieldKind::TaggedEnum(schema) => {
+            if options.unwrap_singleton_arrays {
+                unwrap_singleton_array(value, Value::is_object, path, log);
+            }
             if let Value::Object(nested) = value {
                 let nested_log = repair_tagged_enum(nested, schema, path, options);
                 log.merge(nested_log);
@@ -554,11 +593,49 @@ fn apply_kind(
             }
         }
         FieldKind::Integer | FieldKind::Number | FieldKind::Bool | FieldKind::String => {
+            if options.unwrap_singleton_arrays {
+                unwrap_singleton_array(
+                    value,
+                    |v| v.is_string() || v.is_number() || v.is_boolean(),
+                    path,
+                    log,
+                );
+            }
             if options.coerce_types {
                 coerce_value(value, kind, path, log);
             }
         }
     }
+}
+
+/// Unwrap a one-element array into its element when the schema expects a
+/// single value and the element matches the expected shape.
+///
+/// The reverse of [`wrap_single_into_array`]; recorded as a [`Correction`]
+/// with similarity `1.0` (like coercions).
+fn unwrap_singleton_array(
+    value: &mut Value,
+    element_matches: impl Fn(&Value) -> bool,
+    path: &str,
+    log: &mut RepairLog,
+) {
+    let Value::Array(arr) = &*value else {
+        return;
+    };
+    if arr.len() != 1 || !element_matches(&arr[0]) {
+        return;
+    }
+    let original = value.to_string();
+    let Value::Array(arr) = std::mem::take(value) else {
+        unreachable!("checked above");
+    };
+    *value = arr.into_iter().next().expect("len checked above");
+    log.corrections.push(Correction::new(
+        original,
+        value.to_string(),
+        1.0,
+        path.to_string(),
+    ));
 }
 
 /// Wrap a single value into a one-element array when the schema expects an
@@ -625,11 +702,22 @@ fn coerce_value(value: &mut Value, kind: &FieldKind, path: &str, log: &mut Repai
 /// Repair a tagged enum JSON object using a TaggedEnumSchema
 ///
 /// This repairs:
-/// 1. The tag field value (e.g., "AddDeriv" -> "AddDerive")
-/// 2. The field names based on the tag value (variant fields + global fields)
-/// 3. Field values according to their [`FieldKind`] — enum arrays, nested
+/// 1. The tag field *key* if it is missing due to a typo (e.g. `"tpye"` →
+///    `"type"`) — only when the typo key's value resolves to a known tag
+/// 2. The tag field value (e.g., "AddDeriv" -> "AddDerive")
+/// 3. The field names based on the tag value (variant fields + global fields)
+/// 4. Field values according to their [`FieldKind`] — enum arrays, nested
 ///    objects (recursively, to any depth), arrays of objects, and scalar
 ///    type coercion
+///
+/// # Missing / unusable tag
+///
+/// When no usable tag remains (absent even after key recovery, or not a
+/// string), the variant cannot be determined — but the schema's *global*
+/// fields still apply to every variant, so they are repaired (names,
+/// defaults, kinds) before returning. Unknown-field dropping is suppressed
+/// in this fallback: without a tag, variant fields cannot be told apart
+/// from junk.
 ///
 /// # Collision behavior (best-match-win)
 ///
@@ -644,6 +732,11 @@ pub fn repair_tagged_enum(
     options: &FuzzyOptions,
 ) -> RepairLog {
     let mut log = RepairLog::default();
+
+    // Step 0: If the tag field is missing, try to recover a typo'd tag key
+    if !obj.contains_key(&schema.tag_field) {
+        recover_tag_key(obj, schema, path, options, &mut log);
+    }
 
     // Step 1: Repair tag field value
     let tag_value = if let Some(tag_val) = obj.get(&schema.tag_field).and_then(|v| v.as_str()) {
@@ -670,7 +763,28 @@ pub fn repair_tagged_enum(
             tag_val.to_string()
         }
     } else {
-        return log; // No tag field, can't repair fields
+        // No usable tag: the variant is unknown, but global fields apply to
+        // every variant — repair them instead of bailing out entirely.
+        // Dropping is suppressed (variant fields look like unknown keys).
+        if !schema.global_fields.is_empty() {
+            let global_names: Vec<&str> = schema
+                .global_fields
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect();
+            let no_drop = options.clone().with_drop_unknown_fields(false);
+            repair_field_names_into(
+                obj,
+                &global_names,
+                Some(schema.tag_field.as_str()),
+                path,
+                &no_drop,
+                &mut log,
+            );
+            fill_missing_defaults(obj, &schema.global_fields, path, options, &mut log);
+            apply_field_kinds(obj, &schema.global_fields, path, options, &mut log);
+        }
+        return log;
     };
 
     // Step 2: Repair field names (variant fields + global fields)
@@ -711,6 +825,59 @@ pub fn repair_tagged_enum(
     log
 }
 
+/// Recover a typo'd tag *key* (e.g. `"tpye": "AddDerive"` → `"type"`).
+///
+/// Conservative double evidence is required before renaming:
+///
+/// 1. the key is fuzzy-close to the schema's tag field name, and
+/// 2. the key's value is a string that is (or is fuzzy-close to) a known
+///    tag value.
+///
+/// This keeps ordinary data fields with tag-like names from being hijacked
+/// into the tag slot.
+fn recover_tag_key(
+    obj: &mut Map<String, Value>,
+    schema: &TaggedEnumSchema,
+    path: &str,
+    options: &FuzzyOptions,
+    log: &mut RepairLog,
+) {
+    // Candidate keys whose *value* could plausibly be a tag value
+    let tag_like_keys: Vec<&str> = obj
+        .iter()
+        .filter(|(_, v)| {
+            v.as_str().is_some_and(|s| {
+                schema.is_valid_tag(s)
+                    || find_closest(
+                        s,
+                        schema.tag_values(),
+                        options.min_similarity,
+                        options.algorithm,
+                    )
+                    .is_some()
+            })
+        })
+        .map(|(k, _)| k.as_str())
+        .collect();
+
+    if let Some(m) = find_closest(
+        &schema.tag_field,
+        tag_like_keys,
+        options.min_similarity,
+        options.algorithm,
+    ) {
+        if let Some(val) = obj.remove(&m.candidate) {
+            log.corrections.push(Correction::new(
+                m.candidate.clone(),
+                schema.tag_field.clone(),
+                m.similarity,
+                format!("{}.{}", path, m.candidate),
+            ));
+            obj.insert(schema.tag_field.clone(), val);
+        }
+    }
+}
+
 /// Repair values in an enum array
 ///
 /// Each string value in the array is fuzzy-matched against `valid_values`.
@@ -747,12 +914,17 @@ pub fn repair_enum_array(
 }
 
 /// Repair a tagged enum from JSON string
+///
+/// Also scans the input text for duplicate object keys (which `serde_json`
+/// collapses to the last occurrence during parsing) and reports them in
+/// [`RepairResult::duplicates`] — detection only, no merge.
 pub fn repair_tagged_enum_json(
     json: &str,
     schema: &TaggedEnumSchema,
     options: &FuzzyOptions,
 ) -> Result<RepairResult, FuzzyError> {
     let mut value: Value = serde_json::from_str(json)?;
+    let duplicates = detect_duplicate_keys(json);
 
     let log = if let Some(obj) = value.as_object_mut() {
         repair_tagged_enum(obj, schema, "$", options)
@@ -766,6 +938,7 @@ pub fn repair_tagged_enum_json(
         skipped: log.skipped,
         filled: log.filled,
         dropped: log.dropped,
+        duplicates,
     })
 }
 
@@ -1499,6 +1672,178 @@ mod tests {
 
         assert_eq!(a.repaired["target"], b.repaired["target"]);
         assert_eq!(a.corrections[0].original, b.corrections[0].original);
+    }
+
+    // ------------------------------------------------------------------
+    // New in 0.5: unwrap, tag-key recovery, tagless fallback, duplicates
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_unwrap_singleton_array_to_enum() {
+        let schema = TaggedEnumSchema::with_tag("type").with_variant(
+            "SetLevel",
+            ObjectSchema::empty()
+                .with_field_kind("level", FieldKind::enum_of(["debug", "info", "warn"])),
+        );
+
+        // LLM emitted a one-element array (with a typo) where a scalar
+        // enum was expected
+        let json = r#"{"type": "SetLevel", "level": ["inof"]}"#;
+        let options = FuzzyOptions::default().with_unwrap_singleton_arrays(true);
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        assert_eq!(result.repaired["level"], "info");
+        // Two corrections: the unwrap and the fuzzy fix
+        assert_eq!(result.corrections.len(), 2);
+    }
+
+    #[test]
+    fn test_unwrap_singleton_array_to_scalar_coercion() {
+        let schema = TaggedEnumSchema::with_tag("type").with_variant(
+            "Configure",
+            ObjectSchema::empty().with_field_kind("timeout", FieldKind::Integer),
+        );
+
+        let json = r#"{"type": "Configure", "timeout": ["30"]}"#;
+        let options = FuzzyOptions::default().with_unwrap_singleton_arrays(true);
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        // Unwrapped then coerced
+        assert_eq!(result.repaired["timeout"], 30);
+    }
+
+    #[test]
+    fn test_unwrap_singleton_array_to_nested_object() {
+        let schema = TaggedEnumSchema::with_tag("type").with_variant(
+            "Configure",
+            ObjectSchema::empty()
+                .with_field_kind("config", FieldKind::Object(ObjectSchema::new(["timeout"]))),
+        );
+
+        let json = r#"{"type": "Configure", "config": [{"timout": 5}]}"#;
+        let options = FuzzyOptions::default().with_unwrap_singleton_arrays(true);
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        assert_eq!(result.repaired["config"]["timeout"], 5);
+    }
+
+    #[test]
+    fn test_unwrap_leaves_multi_element_and_mismatched_arrays() {
+        let schema = TaggedEnumSchema::with_tag("type").with_variant(
+            "SetLevel",
+            ObjectSchema::empty()
+                .with_field_kind("level", FieldKind::enum_of(["debug", "info"]))
+                .with_field_kind("timeout", FieldKind::Integer),
+        );
+
+        // Multi-element array and shape-mismatched element are left alone
+        let json = r#"{"type": "SetLevel", "level": ["debug", "info"], "timeout": [{"x": 1}]}"#;
+        let options = FuzzyOptions::default().with_unwrap_singleton_arrays(true);
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        assert!(result.repaired["level"].is_array());
+        assert!(result.repaired["timeout"].is_array());
+        assert!(!result.has_corrections());
+    }
+
+    #[test]
+    fn test_unwrap_disabled_by_default() {
+        let schema = TaggedEnumSchema::with_tag("type").with_variant(
+            "SetLevel",
+            ObjectSchema::empty().with_field_kind("level", FieldKind::enum_of(["info"])),
+        );
+
+        let json = r#"{"type": "SetLevel", "level": ["info"]}"#;
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+
+        assert!(result.repaired["level"].is_array());
+        assert!(!result.has_corrections());
+    }
+
+    #[test]
+    fn test_tag_key_typo_recovered() {
+        // The tag *key* itself is typo'd: "tpye" -> "type", then the tag
+        // value and fields repair as usual.
+        let schema = test_schema();
+        let json = r#"{"tpye": "AddDeriv", "taget": "User"}"#;
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+
+        assert_eq!(result.repaired["type"], "AddDerive");
+        assert_eq!(result.repaired["target"], "User");
+        assert!(result.repaired.get("tpye").is_none());
+        // tag key + tag value + field name
+        assert_eq!(result.corrections.len(), 3);
+        assert!(result.corrections.iter().any(|c| c.original == "tpye"));
+    }
+
+    #[test]
+    fn test_tag_key_recovery_requires_tag_like_value() {
+        // "tpye" is close to "type" but its value is not tag-like — the
+        // key must NOT be hijacked into the tag slot.
+        let schema = test_schema();
+        let json = r#"{"tpye": 42, "target": "User"}"#;
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+
+        assert_eq!(result.repaired["tpye"], 42);
+        assert!(result.repaired.get("type").is_none());
+    }
+
+    #[test]
+    fn test_missing_tag_still_repairs_global_fields() {
+        // No tag at all: variant is unknown, but global fields are still
+        // repaired (previously the whole object was returned untouched).
+        let schema = TaggedEnumSchema::new("type", &["AddDerive"], |_| Some(&["target"][..]))
+            .with_enum_array("derives", ["Debug", "Clone"])
+            .with_field_kind("timeout", FieldKind::Integer);
+
+        let json = r#"{"derivs": ["Debg"], "timeout": "30", "taget": "User"}"#;
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+
+        // Global field name + enum value + coercion repaired
+        assert_eq!(result.repaired["derives"][0], "Debug");
+        assert_eq!(result.repaired["timeout"], 30);
+        // Variant field "taget" untouched (variant unknown)
+        assert_eq!(result.repaired["taget"], "User");
+    }
+
+    #[test]
+    fn test_missing_tag_fallback_never_drops_fields() {
+        // Even with drop_unknown_fields on, the tagless fallback must not
+        // drop anything — variant fields can't be told apart from junk.
+        let schema = TaggedEnumSchema::new("type", &["AddDerive"], |_| Some(&["target"][..]))
+            .with_field_kind("timeout", FieldKind::Integer);
+
+        let json = r#"{"target": "User", "extra": 1}"#;
+        let options = FuzzyOptions::default().with_drop_unknown_fields(true);
+        let result = repair_tagged_enum_json(json, &schema, &options).unwrap();
+
+        assert_eq!(result.repaired["target"], "User");
+        assert_eq!(result.repaired["extra"], 1);
+        assert!(!result.has_dropped());
+    }
+
+    #[test]
+    fn test_duplicate_keys_reported() {
+        let schema = test_schema();
+        let json = r#"{"type": "AddDerive", "target": "User", "target": "Post"}"#;
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+
+        // serde_json kept the last occurrence; the loss is made visible
+        assert_eq!(result.repaired["target"], "Post");
+        assert!(result.has_duplicates());
+        assert_eq!(result.duplicates.len(), 1);
+        assert_eq!(result.duplicates[0].key, "target");
+        assert_eq!(result.duplicates[0].field_path, "$.target");
+        assert_eq!(result.duplicates[0].count, 2);
+    }
+
+    #[test]
+    fn test_no_duplicates_reported_for_clean_input() {
+        let schema = test_schema();
+        let json = r#"{"type": "AddDerive", "target": "User"}"#;
+        let result = repair_tagged_enum_json(json, &schema, &FuzzyOptions::default()).unwrap();
+
+        assert!(!result.has_duplicates());
     }
 
     #[test]

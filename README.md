@@ -65,6 +65,7 @@ assert_eq!(result.repaired["derives"][0], "Debug");     // Debg → Debug
 | Target | Before | After |
 |--------|--------|-------|
 | Tag value (enum discriminator) | `"AddDeriv"` | `"AddDerive"` |
+| Tag key itself | `{"tpye": "AddDerive"}` | `{"type": "AddDerive"}` |
 | Field name | `"taget"` | `"target"` |
 | Enum string value | `"inof"` | `"info"` |
 | Enum array value | `["Debg"]` | `["Debug"]` |
@@ -92,6 +93,7 @@ in the result log:
 | Option | Before | After | Logged as |
 |--------|--------|-------|-----------|
 | `with_wrap_single_values(true)` | `"derives": "Debug"` | `"derives": ["Debug"]` | `Correction` |
+| `with_unwrap_singleton_arrays(true)` | `"level": ["info"]` | `"level": "info"` | `Correction` |
 | `with_fill_defaults(true)` | `{}` (field missing, default defined) | `{"retries": 3}` | `FilledDefault` |
 | `with_drop_unknown_fields(true)` | `{"note": "hope this helps!"}` | `{}` (value kept in log) | `DroppedField` |
 
@@ -362,8 +364,9 @@ for skipped in &result.skipped {
 2. **Schema-driven**: Caller defines the schema (library remains generic)
 3. **Transparency**: All corrections are recorded as `Correction` structs;
    collision-skipped renames as `SkippedCorrection`, filled defaults as
-   `FilledDefault`, and dropped fields as `DroppedField` (removed values
-   are preserved in the log)
+   `FilledDefault`, dropped fields as `DroppedField` (removed values are
+   preserved in the log), and duplicate input keys as `DuplicateKey`
+   (`serde_json` keeps the last occurrence — the loss is made visible)
 4. **Safety**: No corrections made below similarity threshold; type coercion
    is lossless-only; lossy-leaning repairs (wrap / fill / drop) are opt-in
    and off by default

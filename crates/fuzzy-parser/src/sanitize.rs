@@ -408,6 +408,161 @@ fn closer_for(opener: char) -> char {
     }
 }
 
+/// A duplicated object key found by [`detect_duplicate_keys`].
+///
+/// `serde_json` silently keeps the **last** occurrence when parsing, so a
+/// duplicate key means earlier values were discarded. Detection makes that
+/// data loss visible; no merge is attempted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateKey {
+    /// The duplicated key
+    pub key: String,
+    /// JSON path to the key (e.g., `$.config.timeout`)
+    pub field_path: String,
+    /// Total number of occurrences within the same object (≥ 2)
+    pub count: usize,
+}
+
+/// Scan a JSON string for duplicate keys within the same object.
+///
+/// Works on syntactically valid (or already-sanitized) JSON with
+/// double-quoted keys; nested objects and arrays are tracked so the
+/// reported `field_path` points at the containing object. Unclosed
+/// structures (truncated input) are still scanned to end of input.
+///
+/// This is a *detection* pass, not a repair: `serde_json` keeps the last
+/// occurrence, and which value survives is left to the parser. Called
+/// automatically by
+/// [`repair_tagged_enum_json`](crate::repair_tagged_enum_json) (results in
+/// [`RepairResult::duplicates`](crate::RepairResult)).
+///
+/// # Example
+///
+/// ```
+/// use fuzzy_parser::detect_duplicate_keys;
+///
+/// let dups = detect_duplicate_keys(r#"{"a": 1, "a": 2, "b": {"c": 1, "c": 2}}"#);
+/// assert_eq!(dups.len(), 2);
+/// assert_eq!(dups[0].key, "a");
+/// assert_eq!(dups[0].field_path, "$.a");
+/// assert_eq!(dups[1].field_path, "$.b.c");
+/// ```
+pub fn detect_duplicate_keys(input: &str) -> Vec<DuplicateKey> {
+    enum Frame {
+        Object {
+            seen: std::collections::BTreeMap<String, usize>,
+            awaiting_key: bool,
+            current_key: Option<String>,
+            path: String,
+        },
+        Array {
+            index: usize,
+            path: String,
+        },
+    }
+
+    // Path of the slot a new container occupies, derived from its parent.
+    fn slot_path(stack: &[Frame]) -> String {
+        match stack.last() {
+            None => "$".to_string(),
+            Some(Frame::Object {
+                path, current_key, ..
+            }) => match current_key {
+                Some(k) => format!("{}.{}", path, k),
+                None => path.clone(),
+            },
+            Some(Frame::Array { path, index }) => format!("{}[{}]", path, index),
+        }
+    }
+
+    fn drain_frame(frame: Frame, out: &mut Vec<DuplicateKey>) {
+        if let Frame::Object { seen, path, .. } = frame {
+            for (key, count) in seen {
+                if count >= 2 {
+                    out.push(DuplicateKey {
+                        field_path: format!("{}.{}", path, key),
+                        key,
+                        count,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                // Parse the whole string literal (escape-aware)
+                let mut s = String::new();
+                let mut escape = false;
+                for n in chars.by_ref() {
+                    if escape {
+                        s.push(n);
+                        escape = false;
+                    } else if n == '\\' {
+                        s.push(n);
+                        escape = true;
+                    } else if n == '"' {
+                        break;
+                    } else {
+                        s.push(n);
+                    }
+                }
+                if let Some(Frame::Object {
+                    seen,
+                    awaiting_key,
+                    current_key,
+                    ..
+                }) = stack.last_mut()
+                {
+                    if *awaiting_key {
+                        *seen.entry(s.clone()).or_insert(0) += 1;
+                        *current_key = Some(s);
+                        *awaiting_key = false;
+                    }
+                }
+            }
+            '{' => {
+                let path = slot_path(&stack);
+                stack.push(Frame::Object {
+                    seen: std::collections::BTreeMap::new(),
+                    awaiting_key: true,
+                    current_key: None,
+                    path,
+                });
+            }
+            '[' => {
+                let path = slot_path(&stack);
+                stack.push(Frame::Array { index: 0, path });
+            }
+            '}' | ']' => {
+                if let Some(frame) = stack.pop() {
+                    drain_frame(frame, &mut out);
+                }
+            }
+            ',' => match stack.last_mut() {
+                Some(Frame::Object { awaiting_key, .. }) => *awaiting_key = true,
+                Some(Frame::Array { index, .. }) => *index += 1,
+                None => {}
+            },
+            _ => {}
+        }
+    }
+
+    // Truncated input: drain whatever is still open
+    while let Some(frame) = stack.pop() {
+        drain_frame(frame, &mut out);
+    }
+
+    // Deterministic order regardless of nesting close order
+    out.sort_by(|a, b| a.field_path.cmp(&b.field_path));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -778,6 +933,59 @@ mod tests {
                 fixed
             );
         }
+    }
+
+    // =========================================================================
+    // Duplicate Key Detection Tests
+    // =========================================================================
+
+    #[test]
+    fn test_detect_duplicates_flat() {
+        let dups = detect_duplicate_keys(r#"{"a": 1, "b": 2, "a": 3}"#);
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].key, "a");
+        assert_eq!(dups[0].field_path, "$.a");
+        assert_eq!(dups[0].count, 2);
+    }
+
+    #[test]
+    fn test_detect_duplicates_nested_path() {
+        let dups = detect_duplicate_keys(r#"{"config": {"timeout": 1, "timeout": 2}}"#);
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].field_path, "$.config.timeout");
+    }
+
+    #[test]
+    fn test_detect_duplicates_in_array_of_objects() {
+        // Duplicates inside one array element; same keys across different
+        // elements are NOT duplicates.
+        let dups = detect_duplicate_keys(r#"{"items": [{"a": 1}, {"a": 1, "a": 2}]}"#);
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].field_path, "$.items[1].a");
+    }
+
+    #[test]
+    fn test_detect_duplicates_none() {
+        assert!(detect_duplicate_keys(r#"{"a": 1, "b": {"a": 2}}"#).is_empty());
+    }
+
+    #[test]
+    fn test_detect_duplicates_value_strings_not_counted() {
+        // A value string equal to a key name must not count as a key
+        assert!(detect_duplicate_keys(r#"{"a": "a", "b": "a"}"#).is_empty());
+    }
+
+    #[test]
+    fn test_detect_duplicates_truncated_input() {
+        let dups = detect_duplicate_keys(r#"{"a": 1, "a": 2, "b": "#);
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].key, "a");
+    }
+
+    #[test]
+    fn test_detect_duplicates_triple() {
+        let dups = detect_duplicate_keys(r#"{"a": 1, "a": 2, "a": 3}"#);
+        assert_eq!(dups[0].count, 3);
     }
 
     // =========================================================================

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `FuzzyOptions::unwrap_singleton_arrays` (opt-in, off by default): unwrap a
+  one-element array into the expected single value (`["info"]` → `"info"`
+  for `Enum`, one-object arrays for `Object` / `TaggedEnum`, one-scalar
+  arrays for coercion kinds). The reverse of `wrap_single_values`.
+- Tag-key typo recovery in `repair_tagged_enum`: a missing tag field is now
+  recovered from a typo'd key (`{"tpye": "AddDerive"}` → `{"type": ...}`)
+  when the key is fuzzy-close to the tag field *and* its value resolves to a
+  known tag (double evidence — data fields with tag-like names are safe).
+- Tagless fallback: when no usable tag remains, global fields are still
+  repaired (names, defaults, kinds) instead of returning the object
+  untouched. Unknown-field dropping is suppressed in this fallback.
+- `detect_duplicate_keys` + `DuplicateKey`: text-level scan for duplicate
+  object keys (`serde_json` silently keeps the last occurrence).
+  `repair_tagged_enum_json` runs it automatically and reports findings in
+  the new `RepairResult::duplicates` field. Detection only — no merge.
+
+### Changed
+
+- `RepairResult` gained the public `duplicates` field; struct-literal
+  construction needs the new field (builder / function callers unaffected).
+
 ## [0.4.0] - 2026-07-22
 
 ### Added

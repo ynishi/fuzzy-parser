@@ -33,8 +33,11 @@
 //! - **Type coercion**: Fix string-encoded scalars (e.g., `"42"` → `42`);
 //!   can be disabled via [`FuzzyOptions`]
 //! - **Schema-shape options** (opt-in, [`FuzzyOptions`]): wrap single
-//!   values into expected arrays, fill missing fields with schema
-//!   defaults, drop unknown fields
+//!   values into expected arrays (and unwrap one-element arrays back),
+//!   fill missing fields with schema defaults, drop unknown fields
+//! - **Duplicate key detection** ([`detect_duplicate_keys`]): duplicate
+//!   input keys (collapsed to last-wins by `serde_json`) are reported in
+//!   [`RepairResult`](RepairResult::duplicates)
 //! - **Dynamic schemas**: Schemas own their data and can be built at runtime
 //! - **JSON Schema import**: Derive repair schemas from JSON Schema
 //!   documents ([`TaggedEnumSchema::from_json_schema`]) or, with the
@@ -107,7 +110,7 @@ pub use repair::{
     repair_tagged_enum_array, repair_tagged_enum_json, Correction, DroppedField, FilledDefault,
     FuzzyOptions, RepairLog, RepairResult, SkipReason, SkippedCorrection,
 };
-pub use sanitize::sanitize_json;
+pub use sanitize::{detect_duplicate_keys, sanitize_json, DuplicateKey};
 pub use schema::{FieldDef, FieldKind, ObjectSchema, TaggedEnumSchema};
 
 #[cfg(test)]
