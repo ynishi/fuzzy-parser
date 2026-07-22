@@ -10,6 +10,10 @@
 //! - **Missing closing brackets**: `["a"` → `["a"]`
 //! - **Mismatched closing delimiters**: `{"a": [1}` → `{"a": [1]}`
 //! - **Stray closing delimiters**: `{"a": 1}}` → `{"a": 1}`
+//! - **Single-quoted strings and keys**: `{'a': 'b'}` → `{"a": "b"}`
+//! - **Unquoted object keys**: `{a: 1}` → `{"a": 1}`
+//! - **Python-style literals**: `True` / `False` / `None` → `true` / `false` / `null`
+//! - **Comments**: `// line`, `/* block */`, and `# line` comments are removed
 //!
 //! # Example
 //!
@@ -55,6 +59,10 @@
 /// - Missing closing braces `}` or brackets `]`
 /// - Mismatched closing delimiters (the expected closer is inserted first)
 /// - Stray closing delimiters with no matching opener (dropped)
+/// - Single-quoted strings / keys (`{'a': 'b'}` → `{"a": "b"}`)
+/// - Unquoted object keys (`{a: 1}` → `{"a": 1}`)
+/// - Python-style literals (`True` / `False` / `None` → `true` / `false` / `null`)
+/// - `//` line, `/* */` block, and `#` line comments (removed)
 ///
 /// # Arguments
 ///
@@ -87,6 +95,12 @@
 ///     r#"{"items": [1, 2], "name": "test"}"#
 /// );
 ///
+/// // Single quotes, unquoted keys, Python literals, comments
+/// assert_eq!(
+///     sanitize_json(r#"{name: 'test', flag: True} // done"#),
+///     r#"{"name": "test", "flag": true} "#
+/// );
+///
 /// // Already valid JSON passes through unchanged
 /// assert_eq!(sanitize_json(r#"{"a": 1}"#), r#"{"a": 1}"#);
 /// ```
@@ -96,11 +110,165 @@ pub fn sanitize_json(input: &str) -> String {
         return String::new();
     }
 
-    // Step 1: Fix missing closing delimiters first
-    let with_delimiters = fix_missing_delimiters(trimmed);
+    // Step 1: Normalize lenient syntax (comments, single quotes,
+    // unquoted keys, Python literals)
+    let normalized = normalize_lenient_syntax(trimmed);
 
-    // Step 2: Remove trailing commas (now that delimiters exist)
+    // Step 2: Fix missing closing delimiters
+    let with_delimiters = fix_missing_delimiters(&normalized);
+
+    // Step 3: Remove trailing commas (now that delimiters exist)
     remove_trailing_commas(&with_delimiters)
+}
+
+/// String-scanner state for [`normalize_lenient_syntax`].
+enum StrState {
+    /// Outside any string literal
+    None,
+    /// Inside a double-quoted string
+    Double,
+    /// Inside a single-quoted string (being converted to double-quoted)
+    Single,
+}
+
+/// Normalize lenient (non-JSON) syntax into strict JSON in one
+/// string-aware scan:
+///
+/// - `// line`, `/* block */`, and `# line` comments are removed (only
+///   outside strings; an unclosed block comment runs to end of input).
+/// - Single-quoted strings become double-quoted: embedded `"` is escaped,
+///   `\'` becomes a plain `'`, other escape pairs pass through.
+/// - Bare identifiers directly followed by `:` are quoted as object keys
+///   (`{a: 1}` → `{"a": 1}`).
+/// - Bare Python literals are mapped: `True` → `true`, `False` → `false`,
+///   `None` → `null`. Other bare identifiers are left untouched.
+fn normalize_lenient_syntax(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut state = StrState::None;
+    let mut escape_next = false;
+
+    while let Some(c) = chars.next() {
+        match state {
+            StrState::Double => {
+                if escape_next {
+                    result.push(c);
+                    escape_next = false;
+                    continue;
+                }
+                match c {
+                    '\\' => {
+                        result.push(c);
+                        escape_next = true;
+                    }
+                    '"' => {
+                        state = StrState::None;
+                        result.push(c);
+                    }
+                    _ => result.push(c),
+                }
+            }
+            StrState::Single => {
+                if escape_next {
+                    if c == '\'' {
+                        // \' has no meaning in JSON — a plain apostrophe
+                        result.push('\'');
+                    } else {
+                        result.push('\\');
+                        result.push(c);
+                    }
+                    escape_next = false;
+                    continue;
+                }
+                match c {
+                    '\\' => escape_next = true,
+                    '\'' => {
+                        state = StrState::None;
+                        result.push('"');
+                    }
+                    '"' => result.push_str("\\\""),
+                    _ => result.push(c),
+                }
+            }
+            StrState::None => match c {
+                '"' => {
+                    state = StrState::Double;
+                    result.push(c);
+                }
+                '\'' => {
+                    state = StrState::Single;
+                    result.push('"');
+                }
+                '/' if chars.peek() == Some(&'/') => {
+                    // Line comment: skip to (but keep) the newline
+                    while let Some(&n) = chars.peek() {
+                        if n == '\n' {
+                            break;
+                        }
+                        chars.next();
+                    }
+                }
+                '/' if chars.peek() == Some(&'*') => {
+                    // Block comment: skip past the closing */ (or to EOF)
+                    chars.next(); // consume '*'
+                    let mut prev = '\0';
+                    for n in chars.by_ref() {
+                        if prev == '*' && n == '/' {
+                            break;
+                        }
+                        prev = n;
+                    }
+                }
+                '#' => {
+                    // Line comment: skip to (but keep) the newline
+                    while let Some(&n) = chars.peek() {
+                        if n == '\n' {
+                            break;
+                        }
+                        chars.next();
+                    }
+                }
+                c if c.is_ascii_alphabetic() || c == '_' || c == '$' => {
+                    let mut ident = String::new();
+                    ident.push(c);
+                    while let Some(&n) = chars.peek() {
+                        if n.is_ascii_alphanumeric() || n == '_' || n == '$' {
+                            ident.push(n);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    // Peek past whitespace: is this identifier a key?
+                    let mut look = chars.clone();
+                    let next_non_ws = loop {
+                        match look.next() {
+                            Some(w) if w.is_whitespace() => continue,
+                            other => break other,
+                        }
+                    };
+                    if next_non_ws == Some(':') {
+                        // Unquoted object key
+                        result.push('"');
+                        result.push_str(&ident);
+                        result.push('"');
+                    } else {
+                        match ident.as_str() {
+                            "True" => result.push_str("true"),
+                            "False" => result.push_str("false"),
+                            "None" => result.push_str("null"),
+                            _ => result.push_str(&ident),
+                        }
+                    }
+                }
+                _ => result.push(c),
+            },
+        }
+    }
+
+    // An unclosed single-quoted string was already reopened as `"`; the
+    // delimiter pass will close it like any other unclosed string.
+    result
 }
 
 /// Remove trailing commas before `}` or `]`
@@ -464,6 +632,152 @@ mod tests {
             sanitize_json(r#"{"a": {"b": {"c": [1, 2,],"#),
             r#"{"a": {"b": {"c": [1, 2]}}}"#
         );
+    }
+
+    // =========================================================================
+    // Lenient Syntax Tests (single quotes, unquoted keys, literals, comments)
+    // =========================================================================
+
+    #[test]
+    fn test_single_quoted_strings() {
+        assert_eq!(sanitize_json(r#"{'a': 'b'}"#), r#"{"a": "b"}"#);
+    }
+
+    #[test]
+    fn test_single_quoted_with_embedded_double_quote() {
+        assert_eq!(
+            sanitize_json(r#"{'msg': 'say "hi"'}"#),
+            r#"{"msg": "say \"hi\""}"#
+        );
+    }
+
+    #[test]
+    fn test_single_quoted_with_escaped_apostrophe() {
+        assert_eq!(
+            sanitize_json(r#"{'msg': 'it\'s ok'}"#),
+            r#"{"msg": "it's ok"}"#
+        );
+    }
+
+    #[test]
+    fn test_apostrophe_inside_double_string_untouched() {
+        assert_eq!(
+            sanitize_json(r#"{"msg": "it's ok"}"#),
+            r#"{"msg": "it's ok"}"#
+        );
+    }
+
+    #[test]
+    fn test_single_quote_comma_brace_protected() {
+        // Commas and braces inside single-quoted strings survive conversion
+        assert_eq!(sanitize_json(r#"{'msg': 'a,}'}"#), r#"{"msg": "a,}"}"#);
+    }
+
+    #[test]
+    fn test_unclosed_single_quoted_string() {
+        assert_eq!(sanitize_json(r#"{'a': 'test"#), r#"{"a": "test"}"#);
+    }
+
+    #[test]
+    fn test_unquoted_keys() {
+        assert_eq!(
+            sanitize_json(r#"{a: 1, b_c: 2, $d: 3}"#),
+            r#"{"a": 1, "b_c": 2, "$d": 3}"#
+        );
+    }
+
+    #[test]
+    fn test_unquoted_key_with_whitespace_before_colon() {
+        assert_eq!(sanitize_json("{timeout : 30}"), r#"{"timeout" : 30}"#);
+    }
+
+    #[test]
+    fn test_python_literals() {
+        assert_eq!(
+            sanitize_json(r#"{"a": True, "b": False, "c": None}"#),
+            r#"{"a": true, "b": false, "c": null}"#
+        );
+    }
+
+    #[test]
+    fn test_python_literals_in_string_untouched() {
+        assert_eq!(sanitize_json(r#"{"a": "True"}"#), r#"{"a": "True"}"#);
+    }
+
+    #[test]
+    fn test_json_literals_untouched() {
+        assert_eq!(
+            sanitize_json(r#"{"a": true, "b": false, "c": null}"#),
+            r#"{"a": true, "b": false, "c": null}"#
+        );
+    }
+
+    #[test]
+    fn test_line_comment_removed() {
+        assert_eq!(
+            sanitize_json("{\"a\": 1, // the answer\n\"b\": 2}"),
+            "{\"a\": 1, \n\"b\": 2}"
+        );
+    }
+
+    #[test]
+    fn test_block_comment_removed() {
+        assert_eq!(sanitize_json(r#"{"a": /* note */ 1}"#), r#"{"a":  1}"#);
+    }
+
+    #[test]
+    fn test_hash_comment_removed() {
+        assert_eq!(
+            sanitize_json("{\"a\": 1 # trailing note\n}"),
+            "{\"a\": 1 \n}"
+        );
+    }
+
+    #[test]
+    fn test_unclosed_block_comment_runs_to_eof() {
+        assert_eq!(sanitize_json(r#"{"a": 1} /* dangling"#), "{\"a\": 1} ");
+    }
+
+    #[test]
+    fn test_url_in_string_not_treated_as_comment() {
+        assert_eq!(
+            sanitize_json(r#"{"url": "https://example.com"}"#),
+            r#"{"url": "https://example.com"}"#
+        );
+    }
+
+    #[test]
+    fn test_hash_in_string_not_treated_as_comment() {
+        assert_eq!(sanitize_json(r##"{"tag": "#1"}"##), r##"{"tag": "#1"}"##);
+    }
+
+    #[test]
+    fn test_lenient_combo_all_at_once() {
+        let input = "{\n  name: 'test', // comment\n  flag: True,\n}";
+        let fixed = sanitize_json(input);
+        let value: serde_json::Value = serde_json::from_str(&fixed).unwrap();
+        assert_eq!(value["name"], "test");
+        assert_eq!(value["flag"], true);
+    }
+
+    #[test]
+    fn test_lenient_outputs_are_valid_json() {
+        for input in [
+            r#"{'a': 'b'}"#,
+            r#"{a: 1}"#,
+            r#"{"a": True}"#,
+            "{\"a\": 1 // c\n}",
+            r#"{'msg': 'it\'s "x", ok'}"#,
+            "{a: 'b', c: None, /* x */ d: [1,2,],",
+        ] {
+            let fixed = sanitize_json(input);
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&fixed).is_ok(),
+                "sanitize_json({:?}) produced invalid JSON: {:?}",
+                input,
+                fixed
+            );
+        }
     }
 
     // =========================================================================

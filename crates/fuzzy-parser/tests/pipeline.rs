@@ -85,6 +85,26 @@ fn full_pipeline_with_all_opt_in_options() {
 }
 
 #[test]
+fn full_pipeline_lenient_syntax() {
+    // Python-ish LLM answer: single quotes, unquoted keys, True, comment
+    let raw = "```json\n{type: 'AddDeriv', target: 'User', // fixed\n derives: ['Debg'], enabled: True}\n```";
+
+    let payload = extract_json(raw).expect("payload should be found");
+    let sanitized = sanitize_json(payload);
+    let schema = TaggedEnumSchema::new("type", &["AddDerive"], |_| {
+        Some(&["target", "derives", "enabled"][..])
+    })
+    .with_enum_array("derives", ["Debug", "Clone"]);
+
+    let result = repair_tagged_enum_json(&sanitized, &schema, &FuzzyOptions::default()).unwrap();
+
+    assert_eq!(result.repaired["type"], "AddDerive");
+    assert_eq!(result.repaired["target"], "User");
+    assert_eq!(result.repaired["derives"], json!(["Debug"]));
+    assert_eq!(result.repaired["enabled"], true);
+}
+
+#[test]
 fn json_schema_import_defaults_flow() {
     let schema_doc = json!({
         "oneOf": [

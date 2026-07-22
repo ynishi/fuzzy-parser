@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `sanitize_json` now normalizes lenient (non-JSON) syntax in a new first
+  pass: single-quoted strings and keys (`{'a': 'b'}` → `{"a": "b"}`),
+  unquoted object keys (`{a: 1}` → `{"a": 1}`), Python-style literals
+  (`True` / `False` / `None` → `true` / `false` / `null`), and `//` line,
+  `/* */` block, and `#` line comments (removed, string-aware). Missing-comma
+  insertion remains deliberately unsupported (documented in Known
+  Limitations).
+
 - Schema-shape repair options on `FuzzyOptions` (all opt-in, off by default):
   - `wrap_single_values`: wrap a single value into a one-element array when
     the schema expects an array (`"Debug"` → `["Debug"]` for `EnumArray`, a

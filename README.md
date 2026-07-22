@@ -55,6 +55,10 @@ assert_eq!(result.repaired["derives"][0], "Debug");     // Debg → Debug
 | Missing closing brace | `{"a": 1` | `{"a": 1}` |
 | Missing closing bracket | `["a"` | `["a"]` |
 | Unclosed string | `{"a": "test` | `{"a": "test"}` |
+| Single-quoted strings / keys | `{'a': 'b'}` | `{"a": "b"}` |
+| Unquoted object keys | `{a: 1}` | `{"a": 1}` |
+| Python-style literals | `{"a": True}` | `{"a": true}` |
+| Comments (`//`, `/* */`, `#`) | `{"a": 1 // note` | `{"a": 1}` |
 
 ### Fuzzy Repair (Typo Correction)
 
@@ -404,14 +408,15 @@ Most 0.1 code compiles unchanged. The differences:
 ## Known Limitations
 
 `sanitize_json` is a **best-effort** syntax repair pass, not a full JSON5 or
-lenient-JSON parser. It targets a small set of common LLM mistakes (trailing
-commas, missing/mismatched/stray closing delimiters, unclosed strings) and
-leaves the input otherwise untouched. In particular, the following are **not**
-repaired:
+lenient-JSON parser. It targets common LLM mistakes (trailing commas,
+missing/mismatched/stray closing delimiters, unclosed strings, single quotes,
+unquoted keys, Python-style literals, comments) and leaves the input
+otherwise untouched. In particular, the following are **not** repaired:
 
-- Single-quoted strings or keys (`{'a': 1}`)
-- Unquoted object keys (`{a: 1}`)
-- Python-style literals (`True` / `False` / `None`) and comments
+- Missing commas between elements (`{"a": 1 "b": 2}`) — inserting them
+  correctly requires guessing value boundaries, which risks corrupting data
+- Unquoted bare-word *values* (`{"a": hello}`)
+- String concatenation, NDJSON, JSONP wrappers, and other exotic shapes
 
 If your inputs need broader lenient parsing, general-purpose crates such as
 [`llm_json`](https://crates.io/crates/llm_json) cover many of these cases.

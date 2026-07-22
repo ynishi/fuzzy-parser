@@ -13,14 +13,16 @@
 //! 1. **Extract** ([`extract_json`]) — locate the JSON payload inside raw
 //!    LLM output (Markdown code fences, surrounding prose, multiple blocks)
 //! 2. **Sanitize** ([`sanitize_json`]) — fix syntax errors (trailing
-//!    commas, missing/mismatched closing delimiters, unclosed strings)
+//!    commas, missing/mismatched closing delimiters, unclosed strings,
+//!    single quotes, unquoted keys, Python literals, comments)
 //! 3. **Repair** ([`repair_tagged_enum_json`]) — fix typos and coerce
 //!    value types, guided by a caller-provided schema
 //!
 //! # Features
 //!
 //! - **JSON extraction**: Pull JSON out of code fences and prose
-//! - **JSON sanitization**: Fix syntax errors (trailing commas, missing braces)
+//! - **JSON sanitization**: Fix syntax errors (trailing commas, missing
+//!   braces, single quotes, unquoted keys, Python literals, comments)
 //! - **Tagged enum repair**: Fix type discriminator typos (e.g., `"AddDeriv"` → `"AddDerive"`)
 //! - **Field name repair**: Fix field name typos (e.g., `"taget"` → `"target"`)
 //! - **Enum value repair**: Fix string values constrained to closed sets
