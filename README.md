@@ -121,10 +121,10 @@ are rejected with an explicit error — annotate the enum with
 
 ```toml
 [dependencies]
-fuzzy-parser = "0.4"
+fuzzy-parser = "0.5"
 
 # Optional: derive repair schemas from #[derive(JsonSchema)] types
-fuzzy-parser = { version = "0.4", features = ["schemars"] }
+fuzzy-parser = { version = "0.5", features = ["schemars"] }
 ```
 
 ## Usage
